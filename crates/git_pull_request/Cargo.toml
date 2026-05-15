@@ -1,0 +1,41 @@
+[package]
+name = "git_pull_request"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/git_pull_request.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+buffer_diff.workspace = true
+multi_buffer.workspace = true
+chrono.workspace = true
+credentials_provider.workspace = true
+editor.workspace = true
+futures.workspace = true
+git.workspace = true
+gpui.workspace = true
+http_client.workspace = true
+language.workspace = true
+log.workspace = true # TODO: remove this?
+project.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+smol.workspace = true
+theme_settings.workspace = true
+ui.workspace = true
+util.workspace = true
+url.workspace = true
+workspace.workspace = true
+zed_actions.workspace = true
+zed_credentials_provider.workspace = true
+
+[dev-dependencies]

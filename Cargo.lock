@@ -7416,6 +7416,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "git_pull_request"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "buffer_diff",
+ "chrono",
+ "credentials_provider",
+ "editor",
+ "futures 0.3.32",
+ "git",
+ "gpui",
+ "http_client",
+ "language",
+ "log",
+ "multi_buffer",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "smol",
+ "theme_settings",
+ "ui",
+ "url",
+ "util",
+ "workspace",
+ "zed_actions",
+ "zed_credentials_provider",
+]
+
+[[package]]
 name = "git_ui"
 version = "0.1.0"
 dependencies = [
@@ -22545,6 +22575,7 @@ dependencies = [
  "git",
  "git_graph",
  "git_hosting_providers",
+ "git_pull_request",
  "git_ui",
  "go_to_line",
  "gpui",
