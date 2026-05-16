@@ -15,12 +15,13 @@ pub struct GitHubPullRequest {
     pub created_at: DateTime<Utc>,
     pub number: u32,
     pub title: String,
-    pub base: GitHubPullRequestBase,
+    pub head: GitHubPullRequestRef,
+    pub base: GitHubPullRequestRef,
     pub user: GitHubPullRequestUser,
 }
 
 #[derive(Debug, Default, Deserialize)]
-pub struct GitHubPullRequestBase {
+pub struct GitHubPullRequestRef {
     #[serde(rename = "ref")]
     pub ref_name: String,
 }

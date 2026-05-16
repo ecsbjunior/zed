@@ -4,13 +4,15 @@ use editor::{
     Addon, Editor, EditorEvent, MultiBuffer, PathKey, SelectionEffects, multibuffer_context_lines,
     scroll::Autoscroll,
 };
+use multi_buffer::ExcerptBoundaryInfo;
 use git::{
     repository::RepoPath,
     status::{DiffTreeType, FileStatus, StatusCode, TrackedStatus, TreeDiffStatus},
 };
 use gpui::{
-    App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, SharedString, TaskExt, WeakEntity, Window, actions,
+    AnyElement, App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString, Subscription,
+    TaskExt, WeakEntity, Window, actions,
 };
 use language::{
     Buffer, BufferId, Capability, DiskState, LanguageRegistry, LineEnding, OffsetRangeExt,
@@ -23,7 +25,10 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
-use ui::{ActiveTheme, Color, FluentBuilder, Icon, IconName, Styled, Tooltip, div};
+use ui::{
+    ActiveTheme, Checkbox, Color, ElevationIndex, FluentBuilder, Icon, IconName, Styled,
+    ToggleState, Tooltip, div, h_flex,
+};
 use util::{ResultExt, paths::PathStyle, rel_path::RelPath, truncate_and_trailoff};
 use workspace::{
     Item, ItemHandle, ItemNavHistory, Workspace,
@@ -32,7 +37,9 @@ use workspace::{
     ui::{Label, v_flex},
 };
 
-use crate::git_pull_request_providers::GitHubPullRequest;
+use crate::{
+    git_pull_request_panel::GitPullRequestPanel, git_pull_request_providers::GitHubPullRequest,
+};
 
 actions!(git, [GitPullRequestOpenFileAtHead]);
 
@@ -45,6 +52,7 @@ struct PrBlob {
 
 struct PrDiffAddon {
     file_statuses: HashMap<BufferId, FileStatus>,
+    workspace: WeakEntity<Workspace>,
 }
 
 impl Addon for PrDiffAddon {
@@ -59,6 +67,55 @@ impl Addon for PrDiffAddon {
     ) -> Option<FileStatus> {
         self.file_statuses.get(&buffer_id).copied()
     }
+
+    fn render_buffer_header_controls(
+        &self,
+        _excerpt_info: &ExcerptBoundaryInfo,
+        buffer: &language::BufferSnapshot,
+        _window: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let file = buffer.file()?;
+        let filename = file.path().as_unix_str().to_owned();
+        let panel = self
+            .workspace
+            .upgrade()?
+            .read(cx)
+            .panel::<GitPullRequestPanel>(cx)?;
+        let is_reviewed = panel.read(cx).is_file_reviewed(&filename);
+        let toggle_state = if is_reviewed {
+            ToggleState::Selected
+        } else {
+            ToggleState::Unselected
+        };
+        let checkbox_id =
+            SharedString::from(format!("pr-file-reviewed-{}", file.path().as_unix_str()));
+        let panel_handle = panel.downgrade();
+        let filename_for_click = filename;
+
+        Some(
+            h_flex()
+                .id("pr-file-header-controls")
+                .text_lg()
+                .child(
+                    Checkbox::new(checkbox_id, toggle_state)
+                        .fill()
+                        .elevation(ElevationIndex::Surface)
+                        .on_click(move |_, _, cx| {
+                            panel_handle
+                                .update(cx, |panel, cx| {
+                                    panel.toggle_file_reviewed(&filename_for_click, cx);
+                                    cx.stop_propagation();
+                                })
+                                .ok();
+                        }),
+                )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .into_any_element(),
+        )
+    }
 }
 
 pub struct GitPullRequestView {
@@ -69,6 +126,7 @@ pub struct GitPullRequestView {
     pull_request: Arc<GitHubPullRequest>,
     multibuffer: Entity<MultiBuffer>,
     _workspace: WeakEntity<Workspace>,
+    _panel_subscription: Option<Subscription>,
 }
 
 impl GitPullRequestView {
@@ -116,6 +174,7 @@ impl GitPullRequestView {
                         let project = workspace.project();
                         let workspace_handle = cx.weak_entity();
                         let pull_request_number = pull_request.number;
+                        let panel = workspace.panel::<GitPullRequestPanel>(cx);
 
                         let pull_request_view = cx.new(|cx| {
                             GitPullRequestView::new(
@@ -123,6 +182,7 @@ impl GitPullRequestView {
                                 pull_request,
                                 project.clone(),
                                 workspace_handle,
+                                panel,
                                 window,
                                 cx,
                             )
@@ -161,10 +221,11 @@ impl GitPullRequestView {
         pull_request: Arc<GitHubPullRequest>,
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
+        panel: Option<Entity<GitPullRequestPanel>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadOnly));
+        let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadWrite));
 
         let editor = cx.new(|cx| {
             let mut editor =
@@ -179,6 +240,12 @@ impl GitPullRequestView {
             editor
         });
 
+        let panel_subscription = panel.map(|panel| {
+            cx.observe(&panel, |this, _, cx| {
+                this.editor.update(cx, |_, cx| cx.notify());
+            })
+        });
+
         let mut this = Self {
             active_repository,
             editor,
@@ -186,6 +253,7 @@ impl GitPullRequestView {
             pull_request,
             multibuffer,
             _workspace: workspace,
+            _panel_subscription: panel_subscription,
         };
 
         this.fetch_pull_request_ref(cx);
@@ -381,8 +449,12 @@ impl GitPullRequestView {
             }
 
             this.update(cx, |this, cx| {
+                let workspace = this._workspace.clone();
                 this.editor.update(cx, |editor, _cx| {
-                    editor.register_addon(PrDiffAddon { file_statuses });
+                    editor.register_addon(PrDiffAddon {
+                        file_statuses,
+                        workspace,
+                    });
                 });
                 cx.notify();
             })?;

@@ -6,8 +6,8 @@ use editor::{Editor, EditorSettings, ui_scrollbar_settings_from_raw};
 use git::{GitHostingProviderRegistry, ParsedGitRemote};
 use gpui::{
     Action, AnyElement, App, AppContext, AsyncWindowContext, ClickEvent, Context, ElementId,
-    Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    Pixels, Render, SharedString, StatefulInteractiveElement, Styled, TaskExt,
+    Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, TaskExt,
     UniformListScrollHandle, WeakEntity, Window, actions, div, px, uniform_list,
 };
 use project::{
@@ -15,12 +15,12 @@ use project::{
     git_store::{GitStoreEvent, Repository, RepositoryEvent},
 };
 use settings::{RegisterSetting, Settings};
-use util::rel_path::RelPath;
 use ui::{
     Button, ButtonCommon, ButtonSize, ButtonStyle, Checkbox, Clickable, DiffStat, FluentBuilder,
     ToggleState,
     utils::{DateTimeType, FormatDistance},
 };
+use util::rel_path::RelPath;
 use workspace::{
     Panel, Workspace,
     dock::{DockPosition, PanelEvent},
@@ -238,12 +238,7 @@ impl GitPullRequestPanel {
         cx.notify();
     }
 
-    fn handle_file_click(
-        &mut self,
-        filename: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_file_click(&mut self, filename: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(idx) = self.selected_pull_request_idx else {
             return;
         };
@@ -260,9 +255,8 @@ impl GitPullRequestPanel {
         self.workspace
             .update(cx, |workspace, cx| {
                 let view = workspace.active_pane().read(cx).items().find_map(|item| {
-                    item.downcast::<GitPullRequestView>().filter(|view| {
-                        view.read(cx).pull_request_number() == pull_request_number
-                    })
+                    item.downcast::<GitPullRequestView>()
+                        .filter(|view| view.read(cx).pull_request_number() == pull_request_number)
                 });
                 if let Some(view) = view {
                     view.update(cx, |view, cx| {
@@ -273,11 +267,15 @@ impl GitPullRequestPanel {
             .ok();
     }
 
-    fn toggle_file_reviewed(&mut self, filename: &str, cx: &mut Context<Self>) {
+    pub fn toggle_file_reviewed(&mut self, filename: &str, cx: &mut Context<Self>) {
         if !self.reviewed_files.remove(filename) {
             self.reviewed_files.insert(filename.to_string());
         }
         cx.notify();
+    }
+
+    pub fn is_file_reviewed(&self, filename: &str) -> bool {
+        self.reviewed_files.contains(filename)
     }
 
     fn toggle_all_files_reviewed(&mut self, cx: &mut Context<Self>) {
@@ -321,14 +319,14 @@ impl GitPullRequestPanel {
     fn render_filter(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .p_2()
-            .h(px(36.))
+            .h(px(24.))
             .justify_between()
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
                 h_flex()
+                    .gap_2()
                     .w_full()
-                    .gap_1p5()
                     .child(
                         Icon::new(IconName::MagnifyingGlass)
                             .size(IconSize::Small)
@@ -361,7 +359,6 @@ impl GitPullRequestPanel {
                         items
                     }),
                 )
-                .px_1p5()
                 .size_full()
                 .flex_grow()
                 .track_scroll(&self.scroll_handle),
@@ -384,14 +381,13 @@ impl GitPullRequestPanel {
     ) -> AnyElement {
         let id = ElementId::Name(format!("entry_{}", idx).into());
 
-        let title = entry.title.as_str();
+        let title = format!("#{} — {}", entry.number, entry.title.as_str());
         let metadata = format!(
-            "{} • {} • #{}",
+            "{} · {} on ",
             entry.user.login,
             FormatDistance::from_now(DateTimeType::Local(entry.created_at.into()))
                 .add_suffix(true)
-                .to_string(),
-            entry.number
+                .to_string()
         );
         let is_selected = Some(idx) == self.selected_pull_request_idx;
 
@@ -399,19 +395,28 @@ impl GitPullRequestPanel {
         let metadata_label = Label::new(metadata)
             .size(LabelSize::XSmall)
             .color(Color::Muted);
+        let head_ref_label = Label::new(SharedString::from(entry.head.ref_name.clone()))
+            .size(LabelSize::XSmall)
+            .color(Color::Muted)
+            .weight(FontWeight::BOLD);
 
         h_flex()
             .id(id)
             .w_full()
             .px_2()
             .py_1()
-            .rounded_sm()
             .cursor_pointer()
             .child(
                 v_flex()
                     .w_full()
                     .child(h_flex().w_full().line_clamp(1).child(title_label))
-                    .child(h_flex().w_full().justify_between().child(metadata_label)),
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .line_clamp(1)
+                            .child(metadata_label)
+                            .child(head_ref_label),
+                    ),
             )
             .when(is_selected, |this| {
                 this.border_1()
@@ -464,14 +469,14 @@ impl GitPullRequestPanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         h_flex()
-            .px_2()
+            .p_2()
             .h(px(24.))
+            .justify_between()
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            .justify_between()
             .child(
                 h_flex()
-                    .gap_1()
+                    .gap_2()
                     .cursor_pointer()
                     .child(
                         IconButton::new("back", IconName::ArrowLeft)
@@ -500,36 +505,37 @@ impl GitPullRequestPanel {
         pull_request: &GitHubPullRequest,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let title = format!("#{} — {}", pull_request.number, pull_request.title.as_str());
         let metadata = format!(
-            "{} · {} · #{}",
+            "{} · {} on ",
             pull_request.user.login,
             FormatDistance::from_now(DateTimeType::Local(pull_request.created_at.into()))
                 .add_suffix(true)
-                .to_string(),
-            pull_request.number
+                .to_string()
         );
 
+        let title_label = Label::new(title).size(LabelSize::Default);
+        let metadata_label = Label::new(metadata)
+            .size(LabelSize::XSmall)
+            .color(Color::Muted);
+        let head_ref_label = Label::new(SharedString::from(pull_request.head.ref_name.clone()))
+            .size(LabelSize::XSmall)
+            .color(Color::Muted)
+            .weight(FontWeight::BOLD);
+
         v_flex()
-            .px_3()
-            .py_2()
-            .gap_0p5()
+            .px_2()
+            .py_1()
             .w_full()
             .border_b_1()
             .border_color(cx.theme().colors().border)
+            .child(h_flex().w_full().overflow_hidden().child(title_label))
             .child(
-                div().w_full().overflow_hidden().child(
-                    Label::new(SharedString::from(format!(
-                        "#{} — {}",
-                        pull_request.number,
-                        pull_request.title.clone()
-                    )))
-                    .size(LabelSize::Default),
-                ),
-            )
-            .child(
-                Label::new(SharedString::from(metadata))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
+                h_flex()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(metadata_label)
+                    .child(head_ref_label),
             )
     }
 
