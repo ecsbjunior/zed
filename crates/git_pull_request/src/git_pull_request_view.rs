@@ -1,10 +1,6 @@
 use anyhow::Context as _;
 use buffer_diff::BufferDiff;
-use editor::{
-    Addon, Editor, EditorEvent, ExcerptRange, MultiBuffer, PathKey,
-    display_map::{BlockPlacement, BlockProperties, BlockStyle},
-    multibuffer_context_lines,
-};
+use editor::{Addon, Editor, EditorEvent, MultiBuffer, PathKey, multibuffer_context_lines};
 use git::{
     repository::RepoPath,
     status::{DiffTreeType, FileStatus, StatusCode, TrackedStatus, TreeDiffStatus},
@@ -14,8 +10,8 @@ use gpui::{
     ParentElement, Render, SharedString, TaskExt, WeakEntity, Window, actions,
 };
 use language::{
-    Anchor, Buffer, BufferId, Capability, DiskState, LanguageRegistry, LineEnding, OffsetRangeExt,
-    Point, ReplicaId, Rope, TextBuffer,
+    Buffer, BufferId, Capability, DiskState, LanguageRegistry, LineEnding, OffsetRangeExt,
+    ReplicaId, Rope, TextBuffer,
 };
 use project::{Project, WorktreeId, git_store::Repository};
 use std::{
@@ -141,29 +137,6 @@ impl GitPullRequestView {
     ) -> Self {
         let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadOnly));
 
-        let message_buffer = cx.new(|cx| {
-            let mut buffer =
-                Buffer::local(format!("{}\n{}", pull_request.title, pull_request.body), cx);
-            buffer.set_capability(Capability::ReadOnly, cx);
-            buffer
-        });
-
-        multibuffer.update(cx, |multibuffer, cx| {
-            let snapshot = message_buffer.read(cx).snapshot();
-            let full_range = Point::zero()..snapshot.max_point();
-            let range = ExcerptRange {
-                context: full_range.clone(),
-                primary: full_range,
-            };
-            multibuffer.set_excerpt_ranges_for_path(
-                PathKey::with_sort_prefix(0u64, RelPath::unix("commit message").unwrap().into()),
-                message_buffer.clone(),
-                &snapshot,
-                vec![range],
-                cx,
-            )
-        });
-
         let editor = cx.new(|cx| {
             let mut editor =
                 Editor::for_multibuffer(multibuffer.clone(), Some(project.clone()), window, cx);
@@ -173,37 +146,6 @@ impl GitPullRequestView {
             editor.set_show_breakpoints(false, cx);
             editor.set_show_diff_review_button(true, cx);
             editor.set_expand_all_diff_hunks(cx);
-            editor.disable_header_for_buffer(message_buffer.read(cx).remote_id(), cx);
-            editor.disable_indent_guides_for_buffer(message_buffer.read(cx).remote_id(), cx);
-
-            editor.insert_blocks(
-                [BlockProperties {
-                    placement: BlockPlacement::Above(editor::Anchor::Min),
-                    height: Some(1),
-                    style: BlockStyle::Sticky,
-                    render: Arc::new(|_| gpui::Empty.into_any_element()),
-                    priority: 0,
-                }]
-                .into_iter()
-                .chain(
-                    editor
-                        .buffer()
-                        .read(cx)
-                        .snapshot(cx)
-                        .anchor_in_buffer(Anchor::max_for_buffer(
-                            message_buffer.read(cx).remote_id(),
-                        ))
-                        .map(|anchor| BlockProperties {
-                            placement: BlockPlacement::Below(anchor),
-                            height: Some(1),
-                            style: BlockStyle::Sticky,
-                            render: Arc::new(|_| gpui::Empty.into_any_element()),
-                            priority: 0,
-                        }),
-                ),
-                None,
-                cx,
-            );
 
             editor
         });

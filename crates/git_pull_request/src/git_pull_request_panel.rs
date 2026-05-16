@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc};
+use std::{collections::HashSet, ops::Range, sync::Arc};
 
 use anyhow::Result;
 use credentials_provider::CredentialsProvider;
@@ -16,7 +16,8 @@ use project::{
 };
 use settings::{RegisterSetting, Settings};
 use ui::{
-    Button, ButtonCommon, ButtonSize, ButtonStyle, Clickable, Disclosure, DiffStat, FluentBuilder,
+    Button, ButtonCommon, ButtonSize, ButtonStyle, Checkbox, Clickable, DiffStat, FluentBuilder,
+    ToggleState,
     utils::{DateTimeType, FormatDistance},
 };
 use workspace::{
@@ -50,13 +51,12 @@ pub enum Event {
 pub struct GitPullRequestPanel {
     active_repository: Option<Entity<Repository>>,
     credentials_provider: Arc<dyn CredentialsProvider>,
-    description_collapsed: bool,
     filter_editor: Entity<Editor>,
     focus_handle: FocusHandle,
     project: Entity<Project>,
     pull_request_files: Vec<Arc<GitHubPullRequestFile>>,
     pull_requests: Vec<Arc<GitHubPullRequest>>,
-    review_editor: Entity<Editor>,
+    reviewed_files: HashSet<String>,
     scroll_handle: UniformListScrollHandle,
     selected_pull_request_idx: Option<usize>,
     workspace: WeakEntity<Workspace>,
@@ -91,12 +91,6 @@ impl GitPullRequestPanel {
                 editor
             });
 
-            let review_editor = cx.new(|cx| {
-                let mut editor = Editor::single_line(window, cx);
-                editor.set_placeholder_text("Leave a review comment...", window, cx);
-                editor
-            });
-
             let scroll_handle = UniformListScrollHandle::new();
 
             cx.subscribe_in(
@@ -120,13 +114,12 @@ impl GitPullRequestPanel {
             let mut this = Self {
                 active_repository,
                 credentials_provider,
-                description_collapsed: false,
                 filter_editor,
                 focus_handle,
                 project,
                 pull_request_files: Vec::new(),
                 pull_requests: Vec::new(),
-                review_editor,
+                reviewed_files: HashSet::new(),
                 scroll_handle,
                 selected_pull_request_idx: None,
                 workspace: workspace.weak_handle(),
@@ -172,7 +165,15 @@ impl GitPullRequestPanel {
         let credentials_provider = self.credentials_provider.clone();
 
         cx.spawn(async move |this, cx| -> anyhow::Result<()> {
-            match fetch_pull_request_files(client, &git_remote, pull_number, credentials_provider, cx).await {
+            match fetch_pull_request_files(
+                client,
+                &git_remote,
+                pull_number,
+                credentials_provider,
+                cx,
+            )
+            .await
+            {
                 Ok(files) => {
                     this.update(cx, |this, cx| {
                         this.pull_request_files = files.into_iter().map(Arc::new).collect();
@@ -213,7 +214,7 @@ impl GitPullRequestPanel {
     ) {
         self.selected_pull_request_idx = Some(idx);
         self.pull_request_files.clear();
-        self.description_collapsed = false;
+        self.reviewed_files.clear();
 
         if let Some(pull_request) = self.pull_requests.get(idx).cloned() {
             self.load_pull_request_files(pull_request.number, cx);
@@ -232,6 +233,33 @@ impl GitPullRequestPanel {
     fn go_back(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.selected_pull_request_idx = None;
         self.pull_request_files.clear();
+        self.reviewed_files.clear();
+        cx.notify();
+    }
+
+    fn toggle_file_reviewed(&mut self, filename: &str, cx: &mut Context<Self>) {
+        if !self.reviewed_files.remove(filename) {
+            self.reviewed_files.insert(filename.to_string());
+        }
+        cx.notify();
+    }
+
+    fn toggle_all_files_reviewed(&mut self, cx: &mut Context<Self>) {
+        let all_reviewed = !self.pull_request_files.is_empty()
+            && self
+                .pull_request_files
+                .iter()
+                .all(|file| self.reviewed_files.contains(&file.filename));
+
+        if all_reviewed {
+            self.reviewed_files.clear();
+        } else {
+            self.reviewed_files = self
+                .pull_request_files
+                .iter()
+                .map(|file| file.filename.clone())
+                .collect();
+        }
         cx.notify();
     }
 }
@@ -367,7 +395,11 @@ impl GitPullRequestPanel {
 }
 
 impl GitPullRequestPanel {
-    fn render_pull_request_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_pull_request_detail(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let Some(idx) = self.selected_pull_request_idx else {
             return v_flex();
         };
@@ -386,10 +418,8 @@ impl GitPullRequestPanel {
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .child(self.render_description(&pull_request, cx))
                     .child(self.render_changes(cx)),
             )
-            .child(self.render_review_footer(window, cx))
     }
 
     fn render_detail_header(
@@ -399,7 +429,7 @@ impl GitPullRequestPanel {
     ) -> impl IntoElement {
         h_flex()
             .px_2()
-            .h(px(36.))
+            .h(px(24.))
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .justify_between()
@@ -451,13 +481,14 @@ impl GitPullRequestPanel {
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
-                div()
-                    .w_full()
-                    .overflow_hidden()
-                    .child(
-                        Label::new(SharedString::from(pull_request.title.clone()))
-                            .size(LabelSize::Default),
-                    ),
+                div().w_full().overflow_hidden().child(
+                    Label::new(SharedString::from(format!(
+                        "#{} — {}",
+                        pull_request.number,
+                        pull_request.title.clone()
+                    )))
+                    .size(LabelSize::Default),
+                ),
             )
             .child(
                 Label::new(SharedString::from(metadata))
@@ -466,61 +497,18 @@ impl GitPullRequestPanel {
             )
     }
 
-    fn render_description(
-        &mut self,
-        pull_request: &GitHubPullRequest,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_collapsed = self.description_collapsed;
-        let body = pull_request.body.clone();
-
-        v_flex()
-            .w_full()
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .child(
-                h_flex()
-                    .px_3()
-                    .py_1p5()
-                    .justify_between()
-                    .child(
-                        h_flex()
-                            .id("description-toggle")
-                            .gap_1()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.description_collapsed = !this.description_collapsed;
-                                cx.notify();
-                            }))
-                            .child(Disclosure::new("description-disclosure", !is_collapsed))
-                            .child(Label::new("Description").size(LabelSize::Small)),
-                    )
-                    .child(
-                        IconButton::new("copy-description", IconName::Copy)
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted)
-                            .on_click({
-                                let body = body.clone();
-                                move |_, _window, cx| {
-                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(body.clone()));
-                                }
-                            }),
-                    ),
-            )
-            .when(!is_collapsed && !body.is_empty(), |this| {
-                this.child(
-                    div()
-                        .px_3()
-                        .pb_2()
-                        .text_sm()
-                        .text_color(cx.theme().colors().text)
-                        .child(SharedString::from(body)),
-                )
-            })
-    }
-
     fn render_changes(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let files = self.pull_request_files.clone();
+        let file_count = files.len();
+        let all_reviewed = file_count > 0
+            && files
+                .iter()
+                .all(|file| self.reviewed_files.contains(&file.filename));
+        let review_all_label = if all_reviewed {
+            "Unreview All"
+        } else {
+            "Review All"
+        };
 
         v_flex()
             .w_full()
@@ -529,13 +517,19 @@ impl GitPullRequestPanel {
                     .px_3()
                     .py_1p5()
                     .justify_between()
-                    .child(Label::new("Changes").size(LabelSize::Small))
                     .child(
-                        Button::new("commits-filter", "All commits")
+                        Label::new(format!("{} Changes", file_count))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Button::new("review-all", review_all_label)
                             .size(ButtonSize::None)
                             .style(ButtonStyle::Transparent)
-                            .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
-                            .label_size(LabelSize::XSmall),
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_all_files_reviewed(cx);
+                            })),
                     ),
             )
             .children(
@@ -577,6 +571,14 @@ impl GitPullRequestPanel {
 
         let additions = file.additions;
         let deletions = file.deletions;
+        let filename = file.filename.clone();
+        let is_reviewed = self.reviewed_files.contains(&file.filename);
+        let toggle_state = if is_reviewed {
+            ToggleState::Selected
+        } else {
+            ToggleState::Unselected
+        };
+        let checkbox_id = ElementId::Name(format!("file_review_{}", idx).into());
 
         h_flex()
             .id(id)
@@ -586,80 +588,48 @@ impl GitPullRequestPanel {
             .gap_1p5()
             .cursor_pointer()
             .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-            .child(Icon::new(status_icon).size(IconSize::Small).color(status_color))
+            .child(
+                Icon::new(status_icon)
+                    .size(IconSize::Small)
+                    .color(status_color),
+            )
             .child(
                 h_flex()
                     .flex_1()
-                    .gap_1()
+                    .min_w_0()
                     .overflow_hidden()
                     .child(
-                        Label::new(file_name)
-                            .size(LabelSize::Small),
+                        div()
+                            .flex_none()
+                            .child(Label::new(format!("{} ", file_name)).size(LabelSize::Small)),
                     )
                     .when(!parent_path.is_empty(), |this| {
                         this.child(
-                            div()
-                                .flex_1()
-                                .overflow_hidden()
-                                .child(
-                                    Label::new(parent_path)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
+                            Label::new(parent_path)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate_start(),
                         )
                     }),
             )
             .child(
                 h_flex()
                     .flex_shrink_0()
-                    .gap_0p5()
-                    .child(DiffStat::new(format!("diff-stat-{idx}"), additions as usize, deletions as usize)),
+                    .gap_1p5()
+                    .child(DiffStat::new(
+                        format!("diff-stat-{idx}"),
+                        additions as usize,
+                        deletions as usize,
+                    ))
+                    .child(
+                        Checkbox::new(checkbox_id, toggle_state).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.toggle_file_reviewed(&filename, cx);
+                            },
+                        )),
+                    ),
             )
             .into_any_element()
-    }
-
-    fn render_review_footer(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        v_flex()
-            .w_full()
-            .border_t_1()
-            .border_color(cx.theme().colors().border)
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_1p5()
-                    .gap_1()
-                    .w_full()
-                    .child(self.review_editor.clone())
-                    .child(
-                        IconButton::new("expand-review", IconName::Maximize)
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .justify_between()
-                    .child(
-                        Button::new("agent-review", "Agent review")
-                            .size(ButtonSize::Compact)
-                            .style(ButtonStyle::Filled)
-                            .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
-                            .label_size(LabelSize::Small),
-                    )
-                    .child(
-                        Button::new("comment", "Comment")
-                            .size(ButtonSize::Compact)
-                            .style(ButtonStyle::Filled)
-                            .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
-                            .label_size(LabelSize::Small),
-                    ),
-            )
     }
 }
 

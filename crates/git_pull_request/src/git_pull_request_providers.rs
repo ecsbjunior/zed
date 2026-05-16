@@ -12,7 +12,6 @@ use url::Url;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct GitHubPullRequest {
-    pub body: String,
     pub created_at: DateTime<Utc>,
     pub number: u32,
     pub title: String,
