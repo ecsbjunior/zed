@@ -1,14 +1,19 @@
-use std::{collections::HashSet, ops::Range, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    ops::Range,
+    sync::Arc,
+};
 
 use anyhow::Result;
 use credentials_provider::CredentialsProvider;
 use editor::{Editor, EditorSettings, ui_scrollbar_settings_from_raw};
+use file_icons::FileIcons;
 use git::{GitHostingProviderRegistry, ParsedGitRemote};
 use gpui::{
     Action, AnyElement, App, AppContext, AsyncWindowContext, ClickEvent, Context, ElementId,
     Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement,
     ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, TaskExt,
-    UniformListScrollHandle, WeakEntity, Window, actions, div, px, uniform_list,
+    UniformListScrollHandle, WeakEntity, Window, actions, div, px, rems, uniform_list,
 };
 use project::{
     Project,
@@ -16,8 +21,8 @@ use project::{
 };
 use settings::{RegisterSetting, Settings};
 use ui::{
-    Button, ButtonCommon, ButtonSize, ButtonStyle, Checkbox, Clickable, DiffStat, FluentBuilder,
-    ToggleState,
+    Button, ButtonCommon, ButtonSize, ButtonStyle, Checkbox, Clickable, DiffStat, ElevationIndex,
+    FluentBuilder, ToggleState, Tooltip,
     utils::{DateTimeType, FormatDistance},
 };
 use util::rel_path::RelPath;
@@ -43,15 +48,39 @@ use crate::{
 actions!(git_pull_request_panel, [ToggleFocus, OpenPullRequestView]);
 
 const GIT_PULL_REQUEST_PANEL_KEY: &str = "GitPullRequestPanel";
+const TREE_INDENT: f32 = 16.0;
+const TREE_GUIDE_OFFSET: f32 = 7.0;
 
 #[derive(Debug)]
 pub enum Event {
     Focus,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum PrFilesViewMode {
+    #[default]
+    Flat,
+    Tree,
+}
+
+enum PrFileTreeEntry {
+    Directory {
+        path: String,
+        name: String,
+        depth: usize,
+        is_collapsed: bool,
+    },
+    File {
+        idx: usize,
+        depth: usize,
+    },
+}
+
 pub struct GitPullRequestPanel {
     active_repository: Option<Entity<Repository>>,
+    collapsed_dirs: HashSet<String>,
     credentials_provider: Arc<dyn CredentialsProvider>,
+    files_view_mode: PrFilesViewMode,
     filter_editor: Entity<Editor>,
     focus_handle: FocusHandle,
     project: Entity<Project>,
@@ -114,7 +143,9 @@ impl GitPullRequestPanel {
 
             let mut this = Self {
                 active_repository,
+                collapsed_dirs: HashSet::new(),
                 credentials_provider,
+                files_view_mode: PrFilesViewMode::default(),
                 filter_editor,
                 focus_handle,
                 project,
@@ -276,6 +307,138 @@ impl GitPullRequestPanel {
 
     pub fn is_file_reviewed(&self, filename: &str) -> bool {
         self.reviewed_files.contains(filename)
+    }
+
+    fn directory_review_state(&self, dir_path: &str) -> ToggleState {
+        let prefix = format!("{}/", dir_path);
+        let mut total = 0;
+        let mut reviewed = 0;
+        for file in &self.pull_request_files {
+            if file.filename.starts_with(&prefix) {
+                total += 1;
+                if self.reviewed_files.contains(&file.filename) {
+                    reviewed += 1;
+                }
+            }
+        }
+        if total == 0 || reviewed == 0 {
+            ToggleState::Unselected
+        } else if reviewed == total {
+            ToggleState::Selected
+        } else {
+            ToggleState::Indeterminate
+        }
+    }
+
+    fn toggle_directory_reviewed(&mut self, dir_path: &str, cx: &mut Context<Self>) {
+        let prefix = format!("{}/", dir_path);
+        let files_in_dir: Vec<String> = self
+            .pull_request_files
+            .iter()
+            .filter(|file| file.filename.starts_with(&prefix))
+            .map(|file| file.filename.clone())
+            .collect();
+        let all_reviewed = !files_in_dir.is_empty()
+            && files_in_dir
+                .iter()
+                .all(|filename| self.reviewed_files.contains(filename));
+
+        if all_reviewed {
+            for filename in &files_in_dir {
+                self.reviewed_files.remove(filename);
+            }
+        } else {
+            for filename in files_in_dir {
+                self.reviewed_files.insert(filename);
+            }
+        }
+        cx.notify();
+    }
+
+    fn build_tree_entries(&self) -> Vec<PrFileTreeEntry> {
+        #[derive(Default)]
+        struct DirNode {
+            children: BTreeMap<String, DirNode>,
+            files: Vec<usize>,
+        }
+
+        let mut root = DirNode::default();
+        for (idx, file) in self.pull_request_files.iter().enumerate() {
+            let parts: Vec<&str> = file.filename.split('/').collect();
+            let dir_parts: &[&str] = if parts.len() > 1 {
+                &parts[..parts.len() - 1]
+            } else {
+                &[]
+            };
+            let mut node = &mut root;
+            for part in dir_parts {
+                node = node.children.entry((*part).to_string()).or_default();
+            }
+            node.files.push(idx);
+        }
+
+        let mut entries = Vec::new();
+        fn walk(
+            node: &DirNode,
+            path: &str,
+            depth: usize,
+            collapsed: &HashSet<String>,
+            entries: &mut Vec<PrFileTreeEntry>,
+        ) {
+            for (name, child) in &node.children {
+                let mut display_parts = vec![name.clone()];
+                let mut path_parts = vec![name.clone()];
+                let mut cursor = child;
+                while cursor.files.is_empty() && cursor.children.len() == 1 {
+                    let Some((child_name, only_child)) = cursor.children.iter().next() else {
+                        break;
+                    };
+                    display_parts.push(child_name.clone());
+                    path_parts.push(child_name.clone());
+                    cursor = only_child;
+                }
+                let display_name = display_parts.join("/");
+                let segment = path_parts.join("/");
+                let full_path = if path.is_empty() {
+                    segment
+                } else {
+                    format!("{}/{}", path, segment)
+                };
+                let is_collapsed = collapsed.contains(&full_path);
+                entries.push(PrFileTreeEntry::Directory {
+                    path: full_path.clone(),
+                    name: display_name,
+                    depth,
+                    is_collapsed,
+                });
+                if !is_collapsed {
+                    walk(cursor, &full_path, depth + 1, collapsed, entries);
+                }
+            }
+            for &file_idx in &node.files {
+                entries.push(PrFileTreeEntry::File {
+                    idx: file_idx,
+                    depth,
+                });
+            }
+        }
+        walk(&root, "", 0, &self.collapsed_dirs, &mut entries);
+        entries
+    }
+
+    fn toggle_files_view_mode(&mut self, cx: &mut Context<Self>) {
+        self.files_view_mode = match self.files_view_mode {
+            PrFilesViewMode::Flat => PrFilesViewMode::Tree,
+            PrFilesViewMode::Tree => PrFilesViewMode::Flat,
+        };
+        cx.notify();
+    }
+
+    fn toggle_directory(&mut self, dir: String, cx: &mut Context<Self>) {
+        if !self.collapsed_dirs.remove(&dir) {
+            self.collapsed_dirs.insert(dir);
+        }
+        cx.notify();
     }
 
     fn toggle_all_files_reviewed(&mut self, cx: &mut Context<Self>) {
@@ -542,22 +705,66 @@ impl GitPullRequestPanel {
     fn render_changes(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let files = self.pull_request_files.clone();
         let file_count = files.len();
-        let all_reviewed = file_count > 0
-            && files
-                .iter()
-                .all(|file| self.reviewed_files.contains(&file.filename));
-        let review_all_label = if all_reviewed {
-            "Unreview All"
+        let reviewed_count = files
+            .iter()
+            .filter(|file| self.reviewed_files.contains(&file.filename))
+            .count();
+        let review_all_state = if file_count == 0 || reviewed_count == 0 {
+            ToggleState::Unselected
+        } else if reviewed_count == file_count {
+            ToggleState::Selected
         } else {
-            "Review All"
+            ToggleState::Indeterminate
+        };
+        let review_all_tooltip = if review_all_state == ToggleState::Selected {
+            "Unreview All Files"
+        } else {
+            "Review All Files"
+        };
+        let is_tree_view = self.files_view_mode == PrFilesViewMode::Tree;
+        let view_mode_text = if is_tree_view {
+            "Flat View"
+        } else {
+            "Tree View"
+        };
+        let view_mode_icon = if is_tree_view {
+            IconName::ListCollapse
+        } else {
+            IconName::ListTree
+        };
+
+        let entries: Vec<_> = match self.files_view_mode {
+            PrFilesViewMode::Flat => files
+                .iter()
+                .enumerate()
+                .map(|(idx, file)| self.render_file_entry(idx, file, 0, cx))
+                .collect(),
+            PrFilesViewMode::Tree => self
+                .build_tree_entries()
+                .into_iter()
+                .map(|entry| match entry {
+                    PrFileTreeEntry::Directory {
+                        path,
+                        name,
+                        depth,
+                        is_collapsed,
+                    } => self.render_directory_entry(&path, &name, depth, is_collapsed, cx),
+                    PrFileTreeEntry::File { idx, depth } => {
+                        let file = files[idx].clone();
+                        self.render_file_entry(idx, &file, depth, cx)
+                    }
+                })
+                .collect(),
         };
 
         v_flex()
             .w_full()
             .child(
                 h_flex()
-                    .px_3()
+                    .pl_3()
+                    .pr_1()
                     .py_1p5()
+                    .gap_2()
                     .justify_between()
                     .child(
                         Label::new(format!("{} Changes", file_count))
@@ -565,30 +772,145 @@ impl GitPullRequestPanel {
                             .color(Color::Muted),
                     )
                     .child(
-                        Button::new("review-all", review_all_label)
-                            .size(ButtonSize::None)
-                            .style(ButtonStyle::Transparent)
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_all_files_reviewed(cx);
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("toggle-files-view", view_mode_text)
+                                    .size(ButtonSize::Compact)
+                                    .label_size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .start_icon(
+                                        Icon::new(view_mode_icon)
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_files_view_mode(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("review-all-wrapper")
+                                    .flex_none()
+                                    .occlude()
+                                    .cursor_pointer()
+                                    .child(
+                                        Checkbox::new("review-all", review_all_state)
+                                            .fill()
+                                            .elevation(ElevationIndex::Surface)
+                                            .tooltip(Tooltip::text(review_all_tooltip))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.toggle_all_files_reviewed(cx);
+                                            })),
+                                    ),
+                            ),
+                    ),
+            )
+            .children(entries)
+    }
+
+    fn render_directory_entry(
+        &self,
+        path: &str,
+        name: &str,
+        depth: usize,
+        is_collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = ElementId::Name(format!("pr_dir_{}", path).into());
+        let checkbox_id = ElementId::Name(format!("pr_dir_review_{}", path).into());
+        let checkbox_wrapper_id = ElementId::Name(format!("pr_dir_review_wrapper_{}", path).into());
+        let path_for_toggle = path.to_string();
+        let path_for_checkbox = path.to_string();
+        let expanded = !is_collapsed;
+        let folder_icon = FileIcons::get_folder_icon(expanded, std::path::Path::new(path), cx);
+        let fallback_folder_icon = if expanded {
+            IconName::FolderOpen
+        } else {
+            IconName::Folder
+        };
+        let toggle_state = self.directory_review_state(path);
+
+        let name_row = h_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .gap_1()
+            .child(Self::render_indent_guides(depth, cx))
+            .child(
+                folder_icon
+                    .map(|folder_icon| {
+                        Icon::from_path(folder_icon)
+                            .size(IconSize::Small)
+                            .color(Color::Muted)
+                    })
+                    .unwrap_or_else(|| {
+                        Icon::new(fallback_folder_icon)
+                            .size(IconSize::Small)
+                            .color(Color::Muted)
+                    }),
+            )
+            .child(
+                Label::new(SharedString::from(name.to_string()))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+            );
+
+        h_flex()
+            .id(id)
+            .w_full()
+            .h(rems(1.75))
+            .pl_3()
+            .pr_1()
+            .gap_1p5()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.toggle_directory(path_for_toggle.clone(), cx);
+            }))
+            .child(name_row)
+            .child(
+                div()
+                    .id(checkbox_wrapper_id)
+                    .flex_none()
+                    .occlude()
+                    .cursor_pointer()
+                    .child(
+                        Checkbox::new(checkbox_id, toggle_state)
+                            .fill()
+                            .elevation(ElevationIndex::Surface)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_directory_reviewed(&path_for_checkbox, cx);
                             })),
                     ),
             )
-            .children(
-                files
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, file)| self.render_file_entry(idx, file, cx)),
-            )
+            .into_any_element()
+    }
+
+    fn render_indent_guides(depth: usize, cx: &App) -> impl IntoElement {
+        let color = cx.theme().colors().panel_indent_guide;
+        h_flex().flex_none().h_full().children((0..depth).map(|_| {
+            h_flex()
+                .flex_none()
+                .w(px(TREE_INDENT))
+                .h_full()
+                .pl(px(TREE_GUIDE_OFFSET))
+                .child(div().w(px(1.0)).h_full().bg(color))
+        }))
     }
 
     fn render_file_entry(
         &self,
         idx: usize,
         file: &GitHubPullRequestFile,
+        depth: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = ElementId::Name(format!("file_entry_{}", idx).into());
+        let is_tree_view = self.files_view_mode == PrFilesViewMode::Tree;
 
         let path = std::path::Path::new(&file.filename);
         let file_name: SharedString = path
@@ -623,41 +945,47 @@ impl GitPullRequestPanel {
         };
         let checkbox_id = ElementId::Name(format!("file_review_{}", idx).into());
 
-        h_flex()
-            .id(id)
-            .w_full()
-            .px_2()
-            .py_1()
+        let name_row = h_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
             .gap_1p5()
-            .cursor_pointer()
-            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.handle_file_click(&filename_for_click, window, cx);
-            }))
+            .when(is_tree_view, |this| {
+                this.child(Self::render_indent_guides(depth, cx))
+            })
             .child(
                 Icon::new(status_icon)
                     .size(IconSize::Small)
                     .color(status_color),
             )
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .flex_none()
-                            .child(Label::new(format!("{} ", file_name)).size(LabelSize::Small)),
-                    )
-                    .when(!parent_path.is_empty(), |this| {
-                        this.child(
-                            Label::new(parent_path)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .truncate_start(),
-                        )
-                    }),
+                div()
+                    .flex_none()
+                    .child(Label::new(format!("{} ", file_name)).size(LabelSize::Small)),
             )
+            .when(!is_tree_view && !parent_path.is_empty(), |this| {
+                this.child(
+                    Label::new(parent_path)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate_start(),
+                )
+            });
+
+        h_flex()
+            .id(id)
+            .w_full()
+            .h(rems(1.75))
+            .pl_3()
+            .pr_1()
+            .gap_1p5()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.handle_file_click(&filename_for_click, window, cx);
+            }))
+            .child(name_row)
             .child(
                 h_flex()
                     .flex_shrink_0()
@@ -668,12 +996,22 @@ impl GitPullRequestPanel {
                         deletions as usize,
                     ))
                     .child(
-                        Checkbox::new(checkbox_id, toggle_state).on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.toggle_file_reviewed(&filename, cx);
-                            },
-                        )),
+                        div()
+                            .id(ElementId::Name(
+                                format!("file_review_wrapper_{}", idx).into(),
+                            ))
+                            .flex_none()
+                            .occlude()
+                            .cursor_pointer()
+                            .child(
+                                Checkbox::new(checkbox_id, toggle_state)
+                                    .fill()
+                                    .elevation(ElevationIndex::Surface)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_file_reviewed(&filename, cx);
+                                    })),
+                            ),
                     ),
             )
             .into_any_element()
