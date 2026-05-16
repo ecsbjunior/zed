@@ -15,6 +15,7 @@ use project::{
     git_store::{GitStoreEvent, Repository, RepositoryEvent},
 };
 use settings::{RegisterSetting, Settings};
+use util::rel_path::RelPath;
 use ui::{
     Button, ButtonCommon, ButtonSize, ButtonStyle, Checkbox, Clickable, DiffStat, FluentBuilder,
     ToggleState,
@@ -235,6 +236,41 @@ impl GitPullRequestPanel {
         self.pull_request_files.clear();
         self.reviewed_files.clear();
         cx.notify();
+    }
+
+    fn handle_file_click(
+        &mut self,
+        filename: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(idx) = self.selected_pull_request_idx else {
+            return;
+        };
+        let Some(pull_request) = self.pull_requests.get(idx) else {
+            return;
+        };
+        let pull_request_number = pull_request.number;
+
+        let Ok(rel_path) = RelPath::unix(filename) else {
+            return;
+        };
+        let path: Arc<RelPath> = rel_path.into();
+
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let view = workspace.active_pane().read(cx).items().find_map(|item| {
+                    item.downcast::<GitPullRequestView>().filter(|view| {
+                        view.read(cx).pull_request_number() == pull_request_number
+                    })
+                });
+                if let Some(view) = view {
+                    view.update(cx, |view, cx| {
+                        view.move_to_path(path, window, cx);
+                    });
+                }
+            })
+            .ok();
     }
 
     fn toggle_file_reviewed(&mut self, filename: &str, cx: &mut Context<Self>) {
@@ -572,6 +608,7 @@ impl GitPullRequestPanel {
         let additions = file.additions;
         let deletions = file.deletions;
         let filename = file.filename.clone();
+        let filename_for_click = filename.clone();
         let is_reviewed = self.reviewed_files.contains(&file.filename);
         let toggle_state = if is_reviewed {
             ToggleState::Selected
@@ -588,6 +625,9 @@ impl GitPullRequestPanel {
             .gap_1p5()
             .cursor_pointer()
             .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.handle_file_click(&filename_for_click, window, cx);
+            }))
             .child(
                 Icon::new(status_icon)
                     .size(IconSize::Small)
@@ -624,6 +664,7 @@ impl GitPullRequestPanel {
                     .child(
                         Checkbox::new(checkbox_id, toggle_state).on_click(cx.listener(
                             move |this, _, _, cx| {
+                                cx.stop_propagation();
                                 this.toggle_file_reviewed(&filename, cx);
                             },
                         )),

@@ -1,6 +1,9 @@
 use anyhow::Context as _;
 use buffer_diff::BufferDiff;
-use editor::{Addon, Editor, EditorEvent, MultiBuffer, PathKey, multibuffer_context_lines};
+use editor::{
+    Addon, Editor, EditorEvent, MultiBuffer, PathKey, SelectionEffects, multibuffer_context_lines,
+    scroll::Autoscroll,
+};
 use git::{
     repository::RepoPath,
     status::{DiffTreeType, FileStatus, StatusCode, TrackedStatus, TreeDiffStatus},
@@ -71,6 +74,32 @@ pub struct GitPullRequestView {
 impl GitPullRequestView {
     pub fn calculate_changed_lines(&self, cx: &App) -> (u32, u32) {
         self.multibuffer.read(cx).snapshot(cx).total_changed_lines()
+    }
+
+    pub fn pull_request_number(&self) -> u32 {
+        self.pull_request.number
+    }
+
+    pub fn move_to_path(
+        &mut self,
+        path: Arc<RelPath>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path_key = PathKey::with_sort_prefix(1u64, path);
+        let Some(position) = self.multibuffer.read(cx).location_for_path(&path_key, cx) else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(
+                SelectionEffects::scroll(Autoscroll::focused()),
+                window,
+                cx,
+                |s| {
+                    s.select_ranges([position..position]);
+                },
+            );
+        });
     }
 
     pub fn open(
