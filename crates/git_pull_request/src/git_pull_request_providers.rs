@@ -80,6 +80,68 @@ fn base_url() -> Url {
     Url::parse("https://api.github.com/repos/").unwrap()
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GitHubPullRequestFile {
+    pub filename: String,
+    pub status: GitHubPullRequestFileStatus,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum GitHubPullRequestFileStatus {
+    Added,
+    Removed,
+    Modified,
+    Renamed,
+    Copied,
+    Changed,
+    Unchanged,
+}
+
+pub async fn fetch_pull_request_files(
+    client: Arc<dyn HttpClient>,
+    remote: &ParsedGitRemote,
+    pull_number: u32,
+    credentials_provider: Arc<dyn CredentialsProvider>,
+    cx: &AsyncApp,
+) -> anyhow::Result<Vec<GitHubPullRequestFile>> {
+    let ParsedGitRemote { owner, repo } = remote;
+    let url = base_url()
+        .join(&format!("{owner}/{repo}/pulls/{pull_number}/files"))
+        .expect("can't build pull request files url")
+        .to_string();
+
+    let mut request = Request::get(&url)
+        .header("Content-Type", "application/json")
+        .follow_redirects(http_client::RedirectPolicy::FollowAll);
+
+    if let Some(github_token) = resolve_github_token(credentials_provider, cx).await {
+        request = request.header("Authorization", format!("Bearer {}", github_token));
+    } else {
+        log::warn!("GITHUB_TOKEN is not set");
+    }
+
+    let mut response = client
+        .send(request.body(AsyncBody::default())?)
+        .await
+        .with_context(|| format!("error fetching pull request files at {:?}", url))?;
+
+    let mut body = Vec::new();
+    response.body_mut().read_to_end(&mut body).await?;
+
+    if response.status().is_client_error() {
+        let text = String::from_utf8_lossy(body.as_slice());
+        bail!(
+            "status error {}, response: {text:?}",
+            response.status().as_u16()
+        );
+    }
+
+    Ok(serde_json::from_slice(&body)?)
+}
+
 const GITHUB_CREDENTIALS_URL: &str = "https://api.github.com";
 
 /// Resolves a GitHub token using a layered fallback chain:

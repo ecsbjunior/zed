@@ -90,6 +90,7 @@ impl GitPullRequestView {
                     .update_in(cx, |workspace, window, cx| {
                         let project = workspace.project();
                         let workspace_handle = cx.weak_entity();
+                        let pull_request_number = pull_request.number;
 
                         let pull_request_view = cx.new(|cx| {
                             GitPullRequestView::new(
@@ -105,14 +106,24 @@ impl GitPullRequestView {
                         let pane = workspace.active_pane();
 
                         pane.update(cx, |pane, cx| {
-                            pane.add_item(
-                                Box::new(pull_request_view),
-                                true,
-                                true,
-                                None,
-                                window,
-                                cx,
-                            );
+                            let idx = pane.items().position(|item| {
+                                item.downcast::<GitPullRequestView>().is_some_and(|this| {
+                                    this.read(cx).pull_request.number == pull_request_number
+                                })
+                            });
+
+                            if let Some(idx) = idx {
+                                pane.activate_item(idx, true, true, window, cx);
+                            } else {
+                                pane.add_item(
+                                    Box::new(pull_request_view),
+                                    true,
+                                    true,
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            }
                         })
                     })
                     .log_err()

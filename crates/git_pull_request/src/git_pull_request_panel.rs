@@ -7,28 +7,34 @@ use git::{GitHostingProviderRegistry, ParsedGitRemote};
 use gpui::{
     Action, AnyElement, App, AppContext, AsyncWindowContext, ClickEvent, Context, ElementId,
     Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    Pixels, Render, StatefulInteractiveElement, Styled, TaskExt, UniformListScrollHandle,
-    WeakEntity, Window, actions, px, uniform_list,
+    Pixels, Render, SharedString, StatefulInteractiveElement, Styled, TaskExt,
+    UniformListScrollHandle, WeakEntity, Window, actions, div, px, uniform_list,
 };
 use project::{
     Project,
     git_store::{GitStoreEvent, Repository, RepositoryEvent},
 };
 use settings::{RegisterSetting, Settings};
-use ui::utils::{DateTimeType, FormatDistance};
+use ui::{
+    Button, ButtonCommon, ButtonSize, ButtonStyle, Clickable, Disclosure, DiffStat, FluentBuilder,
+    utils::{DateTimeType, FormatDistance},
+};
 use workspace::{
     Panel, Workspace,
     dock::{DockPosition, PanelEvent},
     ui::{
-        ActiveTheme, Color, Icon, IconName, IconSize, Label, LabelCommon, LabelSize, ScrollAxes,
-        Scrollbars, WithScrollbar, h_flex,
+        ActiveTheme, Color, Icon, IconButton, IconName, IconSize, Label, LabelCommon, LabelSize,
+        ScrollAxes, Scrollbars, WithScrollbar, h_flex,
         scrollbars::{ScrollbarVisibility, ShowScrollbar},
         v_flex,
     },
 };
 
 use crate::{
-    git_pull_request_providers::{GitHubPullRequest, fetch_pull_requests},
+    git_pull_request_providers::{
+        GitHubPullRequest, GitHubPullRequestFile, GitHubPullRequestFileStatus,
+        fetch_pull_request_files, fetch_pull_requests,
+    },
     git_pull_request_view::GitPullRequestView,
 };
 
@@ -44,12 +50,15 @@ pub enum Event {
 pub struct GitPullRequestPanel {
     active_repository: Option<Entity<Repository>>,
     credentials_provider: Arc<dyn CredentialsProvider>,
+    description_collapsed: bool,
     filter_editor: Entity<Editor>,
     focus_handle: FocusHandle,
     project: Entity<Project>,
-    // TODO: change GitHubPullRequest, use an abstraction
+    pull_request_files: Vec<Arc<GitHubPullRequestFile>>,
     pull_requests: Vec<Arc<GitHubPullRequest>>,
+    review_editor: Entity<Editor>,
     scroll_handle: UniformListScrollHandle,
+    selected_pull_request_idx: Option<usize>,
     workspace: WeakEntity<Workspace>,
 }
 
@@ -82,6 +91,12 @@ impl GitPullRequestPanel {
                 editor
             });
 
+            let review_editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("Leave a review comment...", window, cx);
+                editor
+            });
+
             let scroll_handle = UniformListScrollHandle::new();
 
             cx.subscribe_in(
@@ -105,11 +120,15 @@ impl GitPullRequestPanel {
             let mut this = Self {
                 active_repository,
                 credentials_provider,
+                description_collapsed: false,
                 filter_editor,
                 focus_handle,
                 project,
+                pull_request_files: Vec::new(),
                 pull_requests: Vec::new(),
+                review_editor,
                 scroll_handle,
+                selected_pull_request_idx: None,
                 workspace: workspace.weak_handle(),
             };
 
@@ -144,6 +163,29 @@ impl GitPullRequestPanel {
         .detach_and_log_err(cx);
     }
 
+    fn load_pull_request_files(&mut self, pull_number: u32, cx: &mut Context<Self>) {
+        let Some(git_remote) = self.get_git_remote(cx) else {
+            return;
+        };
+
+        let client = cx.http_client();
+        let credentials_provider = self.credentials_provider.clone();
+
+        cx.spawn(async move |this, cx| -> anyhow::Result<()> {
+            match fetch_pull_request_files(client, &git_remote, pull_number, credentials_provider, cx).await {
+                Ok(files) => {
+                    this.update(cx, |this, cx| {
+                        this.pull_request_files = files.into_iter().map(Arc::new).collect();
+                        cx.notify();
+                    })?;
+                }
+                Err(err) => log::error!("{:?}", err),
+            }
+            Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn get_git_remote(&self, cx: &Context<Self>) -> Option<ParsedGitRemote> {
         let Some(repository) = self.active_repository.as_ref() else {
             return None;
@@ -163,38 +205,51 @@ impl GitPullRequestPanel {
         Some(git_remote)
     }
 
-    fn open_git_pull_request_view(
+    fn handle_pull_request_click(
         &mut self,
-        ix: usize,
+        idx: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(pull_request) = self.pull_requests.get(ix) {
+        self.selected_pull_request_idx = Some(idx);
+        self.pull_request_files.clear();
+        self.description_collapsed = false;
+
+        if let Some(pull_request) = self.pull_requests.get(idx).cloned() {
+            self.load_pull_request_files(pull_request.number, cx);
             GitPullRequestView::open(
                 self.active_repository.clone(),
-                pull_request.clone(),
+                pull_request,
                 self.workspace.clone(),
                 window,
                 cx,
             );
         }
+
+        cx.notify();
+    }
+
+    fn go_back(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_pull_request_idx = None;
+        self.pull_request_files.clear();
+        cx.notify();
     }
 }
 
 impl Render for GitPullRequestPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
+        v_flex()
             .id("git-pull-request-panel")
             .size_full()
             .track_focus(&self.focus_handle(cx))
             .bg(cx.theme().colors().panel_background)
-            .child(
-                v_flex()
-                    .gap_2()
-                    .size_full()
-                    .child(self.render_filter(cx))
-                    .child(self.render_pull_requests(window, cx)),
-            )
+            .when(self.selected_pull_request_idx.is_none(), |this| {
+                this.child(self.render_filter(cx))
+                    .child(self.render_pull_requests(window, cx))
+            })
+            .when(self.selected_pull_request_idx.is_some(), |this| {
+                this.child(self.render_pull_request_detail(window, cx))
+            })
     }
 }
 
@@ -202,7 +257,7 @@ impl GitPullRequestPanel {
     fn render_filter(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .p_2()
-            .h(px(24.))
+            .h(px(36.))
             .justify_between()
             .border_b_1()
             .border_color(cx.theme().colors().border)
@@ -233,9 +288,9 @@ impl GitPullRequestPanel {
                     cx.processor(move |this, range: Range<usize>, _window, cx| {
                         let mut items = Vec::with_capacity(range.end - range.start);
 
-                        for ix in range {
-                            if let Some(entry) = this.pull_requests.get(ix) {
-                                items.push(this.render_pull_request_entry(ix, entry, cx))
+                        for idx in range {
+                            if let Some(entry) = this.pull_requests.get(idx) {
+                                items.push(this.render_pull_request_entry(idx, entry, cx))
                             }
                         }
 
@@ -259,11 +314,11 @@ impl GitPullRequestPanel {
 
     fn render_pull_request_entry(
         &self,
-        ix: usize,
+        idx: usize,
         entry: &GitHubPullRequest,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let id = ElementId::Name(format!("entry_{}", ix).into());
+        let id = ElementId::Name(format!("entry_{}", idx).into());
 
         let title = entry.title.as_str();
         let metadata = format!(
@@ -274,9 +329,9 @@ impl GitPullRequestPanel {
                 .to_string(),
             entry.number
         );
+        let is_selected = Some(idx) == self.selected_pull_request_idx;
 
-        // TODO: single line??
-        let title_label = Label::new(title).size(LabelSize::Default).single_line();
+        let title_label = Label::new(title).size(LabelSize::Default);
         let metadata_label = Label::new(metadata)
             .size(LabelSize::XSmall)
             .color(Color::Muted);
@@ -291,19 +346,320 @@ impl GitPullRequestPanel {
             .child(
                 v_flex()
                     .w_full()
-                    .child(title_label)
+                    .child(h_flex().w_full().line_clamp(1).child(title_label))
                     .child(h_flex().w_full().justify_between().child(metadata_label)),
             )
+            .when(is_selected, |this| {
+                this.border_1()
+                    .border_color(cx.theme().colors().border_selected)
+            })
             .hover(|style| {
                 let hover_color = cx.theme().colors().ghost_element_hover;
                 style.bg(hover_color).border_color(hover_color)
             })
             .on_click({
                 cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                    this.open_git_pull_request_view(ix, window, cx)
+                    this.handle_pull_request_click(idx, window, cx);
                 })
             })
             .into_any_element()
+    }
+}
+
+impl GitPullRequestPanel {
+    fn render_pull_request_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(idx) = self.selected_pull_request_idx else {
+            return v_flex();
+        };
+        let Some(pull_request) = self.pull_requests.get(idx).cloned() else {
+            return v_flex();
+        };
+
+        v_flex()
+            .size_full()
+            .child(self.render_detail_header(&pull_request, cx))
+            .child(self.render_pr_info_block(&pull_request, cx))
+            .child(
+                div()
+                    .id("pr-detail-content")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .child(self.render_description(&pull_request, cx))
+                    .child(self.render_changes(cx)),
+            )
+            .child(self.render_review_footer(window, cx))
+    }
+
+    fn render_detail_header(
+        &self,
+        _pull_request: &GitHubPullRequest,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .px_2()
+            .h(px(36.))
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .justify_between()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .cursor_pointer()
+                    .child(
+                        IconButton::new("back", IconName::ArrowLeft)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx))),
+                    )
+                    .child(
+                        Label::new("All open PRs")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                IconButton::new("refresh", IconName::RotateCw)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.update_pull_requests(cx);
+                    })),
+            )
+    }
+
+    fn render_pr_info_block(
+        &self,
+        pull_request: &GitHubPullRequest,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let metadata = format!(
+            "{} · {} · #{}",
+            pull_request.user.login,
+            FormatDistance::from_now(DateTimeType::Local(pull_request.created_at.into()))
+                .add_suffix(true)
+                .to_string(),
+            pull_request.number
+        );
+
+        v_flex()
+            .px_3()
+            .py_2()
+            .gap_0p5()
+            .w_full()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(
+                        Label::new(SharedString::from(pull_request.title.clone()))
+                            .size(LabelSize::Default),
+                    ),
+            )
+            .child(
+                Label::new(SharedString::from(metadata))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+    }
+
+    fn render_description(
+        &mut self,
+        pull_request: &GitHubPullRequest,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_collapsed = self.description_collapsed;
+        let body = pull_request.body.clone();
+
+        v_flex()
+            .w_full()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_1p5()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .id("description-toggle")
+                            .gap_1()
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.description_collapsed = !this.description_collapsed;
+                                cx.notify();
+                            }))
+                            .child(Disclosure::new("description-disclosure", !is_collapsed))
+                            .child(Label::new("Description").size(LabelSize::Small)),
+                    )
+                    .child(
+                        IconButton::new("copy-description", IconName::Copy)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .on_click({
+                                let body = body.clone();
+                                move |_, _window, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(body.clone()));
+                                }
+                            }),
+                    ),
+            )
+            .when(!is_collapsed && !body.is_empty(), |this| {
+                this.child(
+                    div()
+                        .px_3()
+                        .pb_2()
+                        .text_sm()
+                        .text_color(cx.theme().colors().text)
+                        .child(SharedString::from(body)),
+                )
+            })
+    }
+
+    fn render_changes(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let files = self.pull_request_files.clone();
+
+        v_flex()
+            .w_full()
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_1p5()
+                    .justify_between()
+                    .child(Label::new("Changes").size(LabelSize::Small))
+                    .child(
+                        Button::new("commits-filter", "All commits")
+                            .size(ButtonSize::None)
+                            .style(ButtonStyle::Transparent)
+                            .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                            .label_size(LabelSize::XSmall),
+                    ),
+            )
+            .children(
+                files
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, file)| self.render_file_entry(idx, file, cx)),
+            )
+    }
+
+    fn render_file_entry(
+        &self,
+        idx: usize,
+        file: &GitHubPullRequestFile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = ElementId::Name(format!("file_entry_{}", idx).into());
+
+        let path = std::path::Path::new(&file.filename);
+        let file_name: SharedString = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| file.filename.clone())
+            .into();
+        let parent_path: SharedString = path
+            .parent()
+            .and_then(|p| {
+                let s = p.to_string_lossy().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            })
+            .unwrap_or_default()
+            .into();
+
+        let (status_icon, status_color) = match file.status {
+            GitHubPullRequestFileStatus::Added => (IconName::SquarePlus, Color::Created),
+            GitHubPullRequestFileStatus::Removed => (IconName::SquareMinus, Color::Deleted),
+            _ => (IconName::SquareDot, Color::Modified),
+        };
+
+        let additions = file.additions;
+        let deletions = file.deletions;
+
+        h_flex()
+            .id(id)
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_1p5()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+            .child(Icon::new(status_icon).size(IconSize::Small).color(status_color))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .gap_1()
+                    .overflow_hidden()
+                    .child(
+                        Label::new(file_name)
+                            .size(LabelSize::Small),
+                    )
+                    .when(!parent_path.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .child(
+                                    Label::new(parent_path)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .gap_0p5()
+                    .child(DiffStat::new(format!("diff-stat-{idx}"), additions as usize, deletions as usize)),
+            )
+            .into_any_element()
+    }
+
+    fn render_review_footer(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .w_full()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1p5()
+                    .gap_1()
+                    .w_full()
+                    .child(self.review_editor.clone())
+                    .child(
+                        IconButton::new("expand-review", IconName::Maximize)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .justify_between()
+                    .child(
+                        Button::new("agent-review", "Agent review")
+                            .size(ButtonSize::Compact)
+                            .style(ButtonStyle::Filled)
+                            .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                            .label_size(LabelSize::Small),
+                    )
+                    .child(
+                        Button::new("comment", "Comment")
+                            .size(ButtonSize::Compact)
+                            .style(ButtonStyle::Filled)
+                            .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                            .label_size(LabelSize::Small),
+                    ),
+            )
     }
 }
 
