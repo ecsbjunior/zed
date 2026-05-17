@@ -14,6 +14,7 @@ use url::Url;
 pub struct GitHubPullRequest {
     pub created_at: DateTime<Utc>,
     pub number: u32,
+    pub node_id: String,
     pub title: String,
     pub head: GitHubPullRequestRef,
     pub base: GitHubPullRequestRef,
@@ -140,6 +141,67 @@ pub async fn fetch_pull_request_files(
     }
 
     Ok(serde_json::from_slice(&body)?)
+}
+
+pub async fn set_pull_request_file_viewed(
+    client: Arc<dyn HttpClient>,
+    pull_request_node_id: String,
+    file_path: String,
+    viewed: bool,
+    credentials_provider: Arc<dyn CredentialsProvider>,
+    cx: &AsyncApp,
+) -> anyhow::Result<()> {
+    let mutation = if viewed {
+        "markFileAsViewed"
+    } else {
+        "unmarkFileAsViewed"
+    };
+    let query = format!(
+        "mutation Set($prId: ID!, $path: String!) {{ {mutation}(input: {{ pullRequestId: $prId, path: $path }}) {{ pullRequest {{ id }} }} }}"
+    );
+    let body = serde_json::json!({
+        "query": query,
+        "variables": {
+            "prId": pull_request_node_id,
+            "path": file_path,
+        }
+    });
+    let body_bytes = serde_json::to_vec(&body)?;
+
+    let mut request = Request::post("https://api.github.com/graphql")
+        .header("Content-Type", "application/json")
+        .follow_redirects(http_client::RedirectPolicy::FollowAll);
+
+    if let Some(github_token) = resolve_github_token(credentials_provider, cx).await {
+        request = request.header("Authorization", format!("Bearer {}", github_token));
+    } else {
+        log::warn!("GITHUB_TOKEN is not set");
+    }
+
+    let mut response = client
+        .send(request.body(AsyncBody::from(body_bytes))?)
+        .await
+        .with_context(|| format!("error marking file viewed: {file_path:?}"))?;
+
+    let mut buf = Vec::new();
+    response.body_mut().read_to_end(&mut buf).await?;
+
+    if !response.status().is_success() {
+        let text = String::from_utf8_lossy(&buf);
+        bail!("status error {}: {text:?}", response.status().as_u16());
+    }
+
+    #[derive(Deserialize)]
+    struct GraphQlResponse {
+        errors: Option<serde_json::Value>,
+    }
+    if let Ok(parsed) = serde_json::from_slice::<GraphQlResponse>(&buf) {
+        if let Some(errors) = parsed.errors {
+            bail!("graphql errors: {errors}");
+        }
+    }
+
+    Ok(())
 }
 
 const GITHUB_CREDENTIALS_URL: &str = "https://api.github.com";

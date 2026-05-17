@@ -21,8 +21,8 @@ use project::{
 };
 use settings::{RegisterSetting, Settings};
 use ui::{
-    Button, ButtonCommon, ButtonSize, ButtonStyle, Checkbox, Clickable, DiffStat, ElevationIndex,
-    FluentBuilder, ToggleState, Tooltip,
+    Button, ButtonCommon, ButtonSize, Checkbox, Clickable, DiffStat, ElevationIndex, FluentBuilder,
+    ToggleState, Tooltip,
     utils::{DateTimeType, FormatDistance},
 };
 use util::rel_path::RelPath;
@@ -40,7 +40,7 @@ use workspace::{
 use crate::{
     git_pull_request_providers::{
         GitHubPullRequest, GitHubPullRequestFile, GitHubPullRequestFileStatus,
-        fetch_pull_request_files, fetch_pull_requests,
+        fetch_pull_request_files, fetch_pull_requests, set_pull_request_file_viewed,
     },
     git_pull_request_view::GitPullRequestView,
 };
@@ -299,10 +299,55 @@ impl GitPullRequestPanel {
     }
 
     pub fn toggle_file_reviewed(&mut self, filename: &str, cx: &mut Context<Self>) {
-        if !self.reviewed_files.remove(filename) {
+        let viewed = if self.reviewed_files.remove(filename) {
+            false
+        } else {
             self.reviewed_files.insert(filename.to_string());
-        }
+            true
+        };
+        self.sync_files_viewed(vec![(filename.to_string(), viewed)], cx);
         cx.notify();
+    }
+
+    fn sync_files_viewed(
+        &self,
+        updates: Vec<(String, bool)>,
+        cx: &mut Context<Self>,
+    ) {
+        if updates.is_empty() {
+            return;
+        }
+        let Some(idx) = self.selected_pull_request_idx else {
+            return;
+        };
+        let Some(pull_request) = self.pull_requests.get(idx) else {
+            return;
+        };
+        let node_id = pull_request.node_id.clone();
+        if node_id.is_empty() {
+            return;
+        }
+        let client = cx.http_client();
+        let credentials = self.credentials_provider.clone();
+
+        cx.spawn(async move |_, cx| -> anyhow::Result<()> {
+            for (path, viewed) in updates {
+                if let Err(err) = set_pull_request_file_viewed(
+                    client.clone(),
+                    node_id.clone(),
+                    path.clone(),
+                    viewed,
+                    credentials.clone(),
+                    cx,
+                )
+                .await
+                {
+                    log::error!("failed to sync viewed state for {path:?}: {err:?}");
+                }
+            }
+            Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     pub fn is_file_reviewed(&self, filename: &str) -> bool {
@@ -343,15 +388,21 @@ impl GitPullRequestPanel {
                 .iter()
                 .all(|filename| self.reviewed_files.contains(filename));
 
+        let mut updates = Vec::with_capacity(files_in_dir.len());
         if all_reviewed {
             for filename in &files_in_dir {
-                self.reviewed_files.remove(filename);
+                if self.reviewed_files.remove(filename) {
+                    updates.push((filename.clone(), false));
+                }
             }
         } else {
             for filename in files_in_dir {
-                self.reviewed_files.insert(filename);
+                if self.reviewed_files.insert(filename.clone()) {
+                    updates.push((filename, true));
+                }
             }
         }
+        self.sync_files_viewed(updates, cx);
         cx.notify();
     }
 
@@ -448,15 +499,21 @@ impl GitPullRequestPanel {
                 .iter()
                 .all(|file| self.reviewed_files.contains(&file.filename));
 
+        let mut updates = Vec::with_capacity(self.pull_request_files.len());
         if all_reviewed {
-            self.reviewed_files.clear();
+            for file in &self.pull_request_files {
+                if self.reviewed_files.remove(&file.filename) {
+                    updates.push((file.filename.clone(), false));
+                }
+            }
         } else {
-            self.reviewed_files = self
-                .pull_request_files
-                .iter()
-                .map(|file| file.filename.clone())
-                .collect();
+            for file in &self.pull_request_files {
+                if self.reviewed_files.insert(file.filename.clone()) {
+                    updates.push((file.filename.clone(), true));
+                }
+            }
         }
+        self.sync_files_viewed(updates, cx);
         cx.notify();
     }
 }
