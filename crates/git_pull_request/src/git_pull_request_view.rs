@@ -301,26 +301,41 @@ impl GitPullRequestView {
         };
 
         let pull_request_number = self.pull_request.number;
+        let base_ref_name = self.pull_request.base.ref_name.clone();
 
         let work_directory = repository
             .read(cx)
             .snapshot()
             .work_directory_abs_path
             .clone();
-        let refspec = format!("pull/{}/head", pull_request_number);
+        let head_refspec = format!(
+            "pull/{n}/head:refs/{n}/head",
+            n = pull_request_number
+        );
+        let base_refspec = format!(
+            "{base_ref_name}:refs/{n}/base",
+            n = pull_request_number
+        );
 
         cx.spawn(async move |this, cx| {
             let output = smol::process::Command::new("git")
                 .current_dir(work_directory.as_ref())
-                .args(["fetch", "origin", &refspec])
+                .args([
+                    "fetch",
+                    "--force",
+                    "origin",
+                    &head_refspec,
+                    &base_refspec,
+                ])
                 .output()
                 .await?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 log::warn!(
-                    "failed to fetch PR #{} ref: {}",
+                    "failed to fetch PR #{} refs (head + base {}): {}",
                     pull_request_number,
+                    base_ref_name,
                     stderr
                 );
             }
@@ -339,7 +354,11 @@ impl GitPullRequestView {
             return;
         };
 
-        let base_branch_ref: SharedString = self.pull_request.base.ref_name.clone().into();
+        let pull_request_number = self.pull_request.number;
+        let head_ref: SharedString =
+            format!("refs/{}/head", pull_request_number).into();
+        let base_ref: SharedString =
+            format!("refs/{}/base", pull_request_number).into();
 
         let work_directory = repository
             .read(cx)
@@ -350,8 +369,8 @@ impl GitPullRequestView {
         let diff_rx = repository.update(cx, |repository, cx| {
             repository.diff_tree(
                 DiffTreeType::MergeBase {
-                    base: base_branch_ref.into(),
-                    head: "FETCH_HEAD".into(),
+                    base: base_ref.clone(),
+                    head: head_ref.clone(),
                 },
                 cx,
             )
@@ -378,15 +397,16 @@ impl GitPullRequestView {
                     String::new()
                 } else {
                     let path_str = repository_path.as_unix_str().to_string();
+                    let revision_path = format!("{head_ref}:{path_str}");
                     let output = smol::process::Command::new("git")
                         .current_dir(work_directory.as_ref())
-                        .args(["show", &format!("FETCH_HEAD:{}", path_str)])
+                        .args(["show", &revision_path])
                         .output()
                         .await?;
                     if output.status.success() {
                         String::from_utf8_lossy(&output.stdout).into_owned()
                     } else {
-                        log::warn!("failed to get file content from FETCH_HEAD:{}", path_str);
+                        log::warn!("failed to get file content from {revision_path}");
                         String::new()
                     }
                 };

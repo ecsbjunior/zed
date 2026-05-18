@@ -7,7 +7,8 @@ use gpui::{
     Action, Anchor, AnyElement, App, AppContext, AsyncWindowContext, ClickEvent, Context,
     ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement,
     IntoElement, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
-    TaskExt, UniformListScrollHandle, WeakEntity, Window, actions, div, px, rems, uniform_list,
+    Task, TaskExt, UniformListScrollHandle, WeakEntity, Window, actions, div, px, rems,
+    uniform_list,
 };
 use project::{
     Project,
@@ -29,8 +30,8 @@ use workspace::{
     Panel, Workspace,
     dock::{DockPosition, PanelEvent},
     ui::{
-        ActiveTheme, Color, Icon, IconButton, IconName, IconSize, Label, LabelCommon, LabelSize,
-        ScrollAxes, Scrollbars, WithScrollbar, h_flex,
+        ActiveTheme, Color, CommonAnimationExt, Icon, IconButton, IconName, IconSize, Label,
+        LabelCommon, LabelSize, ScrollAxes, Scrollbars, WithScrollbar, h_flex,
         scrollbars::{ScrollbarVisibility, ShowScrollbar},
         v_flex,
     },
@@ -39,8 +40,9 @@ use workspace::{
 use crate::{
     git_pull_request_providers::{
         GitHubPullRequest, GitHubPullRequestFile, GitHubPullRequestFileStatus,
-        PullRequestReviewEvent, fetch_pull_request_files, fetch_pull_request_viewed_files,
-        fetch_pull_requests, set_pull_request_file_viewed, submit_pull_request_review,
+        PULL_REQUEST_FILES_PER_PAGE, PULL_REQUESTS_PER_PAGE, PullRequestReviewEvent,
+        fetch_pull_request_files_page, fetch_pull_request_viewed_files, fetch_pull_requests_page,
+        set_pull_request_file_viewed, submit_pull_request_review,
     },
     git_pull_request_view::GitPullRequestView,
 };
@@ -86,7 +88,9 @@ pub struct GitPullRequestPanel {
     is_submitting_review: bool,
     project: Entity<Project>,
     pull_request_files: Vec<Arc<GitHubPullRequestFile>>,
+    pull_request_files_load_task: Option<Task<()>>,
     pull_requests: Vec<Arc<GitHubPullRequest>>,
+    pull_requests_load_task: Option<Task<()>>,
     review_editor: Entity<Editor>,
     selected_review_event: PullRequestReviewEvent,
     reviewed_files: HashSet<String>,
@@ -169,7 +173,9 @@ impl GitPullRequestPanel {
                 is_submitting_review: false,
                 project,
                 pull_request_files: Vec::new(),
+                pull_request_files_load_task: None,
                 pull_requests: Vec::new(),
+                pull_requests_load_task: None,
                 review_editor,
                 selected_review_event: PullRequestReviewEvent::Comment,
                 reviewed_files: HashSet::new(),
@@ -194,19 +200,48 @@ impl GitPullRequestPanel {
         let client = cx.http_client();
         let credentials_provider = self.credentials_provider.clone();
 
-        cx.spawn(async move |this, cx| -> anyhow::Result<()> {
-            match fetch_pull_requests(client, &git_remote, credentials_provider, cx).await {
-                Ok(pull_requests) => {
-                    this.update(cx, |this, cx| {
-                        this.pull_requests = pull_requests.into_iter().map(Arc::new).collect();
-                        cx.notify();
-                    })?;
+        self.pull_requests.clear();
+        self.selected_pull_request_idx = None;
+        cx.notify();
+
+        self.pull_requests_load_task = Some(cx.spawn(async move |this, cx| {
+            let mut page: u32 = 1;
+            loop {
+                let prs = match fetch_pull_requests_page(
+                    client.clone(),
+                    &git_remote,
+                    page,
+                    PULL_REQUESTS_PER_PAGE,
+                    credentials_provider.clone(),
+                    cx,
+                )
+                .await
+                {
+                    Ok(prs) => prs,
+                    Err(err) => {
+                        log::error!("{:?}", err);
+                        break;
+                    }
+                };
+                let fetched = prs.len() as u32;
+                let update_result = this.update(cx, |this, cx| {
+                    this.pull_requests
+                        .extend(prs.into_iter().map(Arc::new));
+                    cx.notify();
+                });
+                if update_result.is_err() {
+                    break;
                 }
-                Err(err) => log::error!("{:?}", err),
-            };
-            Ok(())
-        })
-        .detach_and_log_err(cx);
+                if fetched < PULL_REQUESTS_PER_PAGE {
+                    break;
+                }
+                page += 1;
+            }
+
+            let _ = this.update(cx, |this, _cx| {
+                this.pull_requests_load_task = None;
+            });
+        }));
     }
 
     fn load_pull_request_files(&mut self, pull_number: u32, cx: &mut Context<Self>) {
@@ -221,23 +256,43 @@ impl GitPullRequestPanel {
         let client = cx.http_client();
         let credentials_provider = self.credentials_provider.clone();
 
-        cx.spawn(async move |this, cx| -> anyhow::Result<()> {
-            match fetch_pull_request_files(
-                client.clone(),
-                &git_remote,
-                pull_number,
-                credentials_provider.clone(),
-                cx,
-            )
-            .await
-            {
-                Ok(files) => {
-                    this.update(cx, |this, cx| {
-                        this.pull_request_files = files.into_iter().map(Arc::new).collect();
-                        cx.notify();
-                    })?;
+        self.pull_request_files.clear();
+        self.reviewed_files.clear();
+        cx.notify();
+
+        self.pull_request_files_load_task = Some(cx.spawn(async move |this, cx| {
+            let mut page: u32 = 1;
+            loop {
+                let files = match fetch_pull_request_files_page(
+                    client.clone(),
+                    &git_remote,
+                    pull_number,
+                    page,
+                    PULL_REQUEST_FILES_PER_PAGE,
+                    credentials_provider.clone(),
+                    cx,
+                )
+                .await
+                {
+                    Ok(files) => files,
+                    Err(err) => {
+                        log::error!("{:?}", err);
+                        break;
+                    }
+                };
+                let fetched = files.len() as u32;
+                let update_result = this.update(cx, |this, cx| {
+                    this.pull_request_files
+                        .extend(files.into_iter().map(Arc::new));
+                    cx.notify();
+                });
+                if update_result.is_err() {
+                    return;
                 }
-                Err(err) => log::error!("{:?}", err),
+                if fetched < PULL_REQUEST_FILES_PER_PAGE {
+                    break;
+                }
+                page += 1;
             }
 
             if let Some(node_id) = pr_node_id.filter(|id| !id.is_empty()) {
@@ -245,17 +300,19 @@ impl GitPullRequestPanel {
                     .await
                 {
                     Ok(viewed) => {
-                        this.update(cx, |this, cx| {
+                        let _ = this.update(cx, |this, cx| {
                             this.reviewed_files = viewed.into_iter().collect();
                             cx.notify();
-                        })?;
+                        });
                     }
                     Err(err) => log::error!("failed to fetch viewed files: {err:?}"),
                 }
             }
-            Ok(())
-        })
-        .detach_and_log_err(cx);
+
+            let _ = this.update(cx, |this, _cx| {
+                this.pull_request_files_load_task = None;
+            });
+        }));
     }
 
     fn get_git_remote(&self, cx: &Context<Self>) -> Option<ParsedGitRemote> {
@@ -632,6 +689,7 @@ impl Render for GitPullRequestPanel {
 
 impl GitPullRequestPanel {
     fn render_filter(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_loading = self.pull_requests_load_task.is_some();
         h_flex()
             .p_2()
             .h(px(24.))
@@ -649,6 +707,22 @@ impl GitPullRequestPanel {
                     )
                     .child(self.filter_editor.clone()),
             )
+            .child(if is_loading {
+                Icon::new(IconName::LoadCircle)
+                    .size(IconSize::Small)
+                    .color(Color::Accent)
+                    .with_rotate_animation(2)
+                    .into_any_element()
+            } else {
+                IconButton::new("refresh-pull-requests", IconName::RotateCw)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Refresh pull requests"))
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.update_pull_requests(cx);
+                    }))
+                    .into_any_element()
+            })
     }
 
     fn render_pull_requests(
@@ -894,7 +968,6 @@ impl GitPullRequestPanel {
         h_flex()
             .p_2()
             .h(px(24.))
-            .justify_between()
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
@@ -912,14 +985,6 @@ impl GitPullRequestPanel {
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     ),
-            )
-            .child(
-                IconButton::new("refresh", IconName::RotateCw)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Muted)
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        this.update_pull_requests(cx);
-                    })),
             )
     }
 
@@ -965,6 +1030,7 @@ impl GitPullRequestPanel {
     fn render_changes(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let files = self.pull_request_files.clone();
         let file_count = files.len();
+        let is_loading_files = self.pull_request_files_load_task.is_some();
         let reviewed_count = files
             .iter()
             .filter(|file| self.reviewed_files.contains(&file.filename))
@@ -1027,9 +1093,21 @@ impl GitPullRequestPanel {
                     .gap_2()
                     .justify_between()
                     .child(
-                        Label::new(format!("{} Changes", file_count))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Label::new(format!("{} Changes", file_count))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .when(is_loading_files, |this| {
+                                this.child(
+                                    Icon::new(IconName::LoadCircle)
+                                        .size(IconSize::Small)
+                                        .color(Color::Accent)
+                                        .with_rotate_animation(2),
+                                )
+                            }),
                     )
                     .child(
                         h_flex()

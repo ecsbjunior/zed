@@ -34,22 +34,30 @@ pub struct GitHubPullRequestUser {
     pub login: String,
 }
 
-pub async fn fetch_pull_requests(
+pub const PULL_REQUESTS_PER_PAGE: u32 = 100;
+
+pub async fn fetch_pull_requests_page(
     client: Arc<dyn HttpClient>,
     remote: &ParsedGitRemote,
+    page: u32,
+    per_page: u32,
     credentials_provider: Arc<dyn CredentialsProvider>,
     cx: &AsyncApp,
 ) -> anyhow::Result<Vec<GitHubPullRequest>> {
-    let url: String = build_fetch_pull_requests_url(remote)
+    let ParsedGitRemote { owner, repo } = remote;
+    let url = base_url()
+        .join(&format!(
+            "{owner}/{repo}/pulls?state=open&per_page={per_page}&page={page}"
+        ))
         .expect("can't build pull request url")
-        .into();
+        .to_string();
 
     let mut request = Request::get(&url)
         .header("Content-Type", "application/json")
         .follow_redirects(http_client::RedirectPolicy::FollowAll);
 
-    if let Some(github_token) = resolve_github_token(credentials_provider, cx).await {
-        request = request.header("Authorization", format!("Bearer {}", github_token));
+    if let Some(token) = resolve_github_token(credentials_provider, cx).await {
+        request = request.header("Authorization", format!("Bearer {}", token));
     } else {
         log::warn!("GITHUB_TOKEN is not set");
     }
@@ -71,12 +79,6 @@ pub async fn fetch_pull_requests(
     }
 
     Ok(serde_json::from_slice(&body)?)
-}
-
-fn build_fetch_pull_requests_url(remote: &ParsedGitRemote) -> Option<Url> {
-    let ParsedGitRemote { owner, repo } = remote;
-
-    base_url().join(&format!("{owner}/{repo}/pulls")).ok()
 }
 
 fn base_url() -> Url {
@@ -224,16 +226,22 @@ pub async fn create_pull_request_review_comment(
     Ok(serde_json::from_slice(&body_buf)?)
 }
 
-pub async fn fetch_pull_request_files(
+pub const PULL_REQUEST_FILES_PER_PAGE: u32 = 100;
+
+pub async fn fetch_pull_request_files_page(
     client: Arc<dyn HttpClient>,
     remote: &ParsedGitRemote,
     pull_number: u32,
+    page: u32,
+    per_page: u32,
     credentials_provider: Arc<dyn CredentialsProvider>,
     cx: &AsyncApp,
 ) -> anyhow::Result<Vec<GitHubPullRequestFile>> {
     let ParsedGitRemote { owner, repo } = remote;
     let url = base_url()
-        .join(&format!("{owner}/{repo}/pulls/{pull_number}/files"))
+        .join(&format!(
+            "{owner}/{repo}/pulls/{pull_number}/files?per_page={per_page}&page={page}"
+        ))
         .expect("can't build pull request files url")
         .to_string();
 
@@ -241,8 +249,8 @@ pub async fn fetch_pull_request_files(
         .header("Content-Type", "application/json")
         .follow_redirects(http_client::RedirectPolicy::FollowAll);
 
-    if let Some(github_token) = resolve_github_token(credentials_provider, cx).await {
-        request = request.header("Authorization", format!("Bearer {}", github_token));
+    if let Some(token) = resolve_github_token(credentials_provider, cx).await {
+        request = request.header("Authorization", format!("Bearer {}", token));
     } else {
         log::warn!("GITHUB_TOKEN is not set");
     }
