@@ -1,28 +1,27 @@
-use std::{
-    collections::{BTreeMap, HashSet},
-    ops::Range,
-    sync::Arc,
-};
-
 use anyhow::Result;
 use credentials_provider::CredentialsProvider;
 use editor::{Editor, EditorSettings, ui_scrollbar_settings_from_raw};
 use file_icons::FileIcons;
 use git::{GitHostingProviderRegistry, ParsedGitRemote};
 use gpui::{
-    Action, AnyElement, App, AppContext, AsyncWindowContext, ClickEvent, Context, ElementId,
-    Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, TaskExt,
-    UniformListScrollHandle, WeakEntity, Window, actions, div, px, rems, uniform_list,
+    Action, Anchor, AnyElement, App, AppContext, AsyncWindowContext, ClickEvent, Context,
+    ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement,
+    IntoElement, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
+    TaskExt, UniformListScrollHandle, WeakEntity, Window, actions, div, px, rems, uniform_list,
 };
 use project::{
     Project,
     git_store::{GitStoreEvent, Repository, RepositoryEvent},
 };
 use settings::{RegisterSetting, Settings};
+use std::{
+    collections::{BTreeMap, HashSet},
+    ops::Range,
+    sync::Arc,
+};
 use ui::{
-    Button, ButtonCommon, ButtonSize, Checkbox, Clickable, DiffStat, ElevationIndex, FluentBuilder,
-    ToggleState, Tooltip,
+    Button, ButtonCommon, ButtonLike, ButtonSize, Checkbox, Clickable, ContextMenu, DiffStat,
+    Disableable, ElevationIndex, FluentBuilder, PopoverMenu, SplitButton, ToggleState, Tooltip,
     utils::{DateTimeType, FormatDistance},
 };
 use util::rel_path::RelPath;
@@ -40,7 +39,8 @@ use workspace::{
 use crate::{
     git_pull_request_providers::{
         GitHubPullRequest, GitHubPullRequestFile, GitHubPullRequestFileStatus,
-        fetch_pull_request_files, fetch_pull_requests, set_pull_request_file_viewed,
+        PullRequestReviewEvent, fetch_pull_request_files, fetch_pull_request_viewed_files,
+        fetch_pull_requests, set_pull_request_file_viewed, submit_pull_request_review,
     },
     git_pull_request_view::GitPullRequestView,
 };
@@ -83,9 +83,12 @@ pub struct GitPullRequestPanel {
     files_view_mode: PrFilesViewMode,
     filter_editor: Entity<Editor>,
     focus_handle: FocusHandle,
+    is_submitting_review: bool,
     project: Entity<Project>,
     pull_request_files: Vec<Arc<GitHubPullRequestFile>>,
     pull_requests: Vec<Arc<GitHubPullRequest>>,
+    review_editor: Entity<Editor>,
+    selected_review_event: PullRequestReviewEvent,
     reviewed_files: HashSet<String>,
     scroll_handle: UniformListScrollHandle,
     selected_pull_request_idx: Option<usize>,
@@ -121,6 +124,21 @@ impl GitPullRequestPanel {
                 editor
             });
 
+            let review_editor = {
+                let project = project.clone();
+                cx.new(|cx| {
+                    let mut editor = Editor::auto_height(3, 3, window, cx);
+                    editor.set_collaboration_hub(Box::new(project));
+                    editor.set_use_autoclose(false);
+                    editor.set_show_gutter(false, cx);
+                    editor.set_use_modal_editing(true);
+                    editor.set_show_wrap_guides(false, cx);
+                    editor.set_show_indent_guides(false, cx);
+                    editor.set_placeholder_text("Leave a review comment…", window, cx);
+                    editor
+                })
+            };
+
             let scroll_handle = UniformListScrollHandle::new();
 
             cx.subscribe_in(
@@ -148,9 +166,12 @@ impl GitPullRequestPanel {
                 files_view_mode: PrFilesViewMode::default(),
                 filter_editor,
                 focus_handle,
+                is_submitting_review: false,
                 project,
                 pull_request_files: Vec::new(),
                 pull_requests: Vec::new(),
+                review_editor,
+                selected_review_event: PullRequestReviewEvent::Comment,
                 reviewed_files: HashSet::new(),
                 scroll_handle,
                 selected_pull_request_idx: None,
@@ -192,16 +213,20 @@ impl GitPullRequestPanel {
         let Some(git_remote) = self.get_git_remote(cx) else {
             return;
         };
+        let pr_node_id = self
+            .selected_pull_request_idx
+            .and_then(|idx| self.pull_requests.get(idx))
+            .map(|pr| pr.node_id.clone());
 
         let client = cx.http_client();
         let credentials_provider = self.credentials_provider.clone();
 
         cx.spawn(async move |this, cx| -> anyhow::Result<()> {
             match fetch_pull_request_files(
-                client,
+                client.clone(),
                 &git_remote,
                 pull_number,
-                credentials_provider,
+                credentials_provider.clone(),
                 cx,
             )
             .await
@@ -213,6 +238,20 @@ impl GitPullRequestPanel {
                     })?;
                 }
                 Err(err) => log::error!("{:?}", err),
+            }
+
+            if let Some(node_id) = pr_node_id.filter(|id| !id.is_empty()) {
+                match fetch_pull_request_viewed_files(client, node_id, credentials_provider, cx)
+                    .await
+                {
+                    Ok(viewed) => {
+                        this.update(cx, |this, cx| {
+                            this.reviewed_files = viewed.into_iter().collect();
+                            cx.notify();
+                        })?;
+                    }
+                    Err(err) => log::error!("failed to fetch viewed files: {err:?}"),
+                }
             }
             Ok(())
         })
@@ -269,6 +308,66 @@ impl GitPullRequestPanel {
         cx.notify();
     }
 
+    fn submit_review(
+        &mut self,
+        event: PullRequestReviewEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_submitting_review {
+            return;
+        }
+        let Some(idx) = self.selected_pull_request_idx else {
+            return;
+        };
+        let Some(pull_request) = self.pull_requests.get(idx).cloned() else {
+            return;
+        };
+        let Some(git_remote) = self.get_git_remote(cx) else {
+            log::error!("no git remote available to submit review");
+            return;
+        };
+
+        let body = self.review_editor.read(cx).text(cx);
+        if matches!(event, PullRequestReviewEvent::RequestChanges) && body.trim().is_empty() {
+            log::warn!("Request Changes requires a non-empty review body");
+            return;
+        }
+
+        self.is_submitting_review = true;
+        cx.notify();
+
+        let pull_number = pull_request.number;
+        let client = cx.http_client();
+        let credentials = self.credentials_provider.clone();
+
+        cx.spawn_in(window, async move |this, cx| -> anyhow::Result<()> {
+            let result = submit_pull_request_review(
+                client,
+                &git_remote,
+                pull_number,
+                body,
+                event,
+                credentials,
+                cx,
+            )
+            .await;
+            this.update_in(cx, |this, window, cx| {
+                this.is_submitting_review = false;
+                if let Err(err) = result {
+                    log::error!("failed to submit review: {err:?}");
+                } else {
+                    this.review_editor.update(cx, |editor, cx| {
+                        editor.clear(window, cx);
+                    });
+                }
+                cx.notify();
+            })?;
+            Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn handle_file_click(&mut self, filename: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(idx) = self.selected_pull_request_idx else {
             return;
@@ -309,11 +408,7 @@ impl GitPullRequestPanel {
         cx.notify();
     }
 
-    fn sync_files_viewed(
-        &self,
-        updates: Vec<(String, bool)>,
-        cx: &mut Context<Self>,
-    ) {
+    fn sync_files_viewed(&self, updates: Vec<(String, bool)>, cx: &mut Context<Self>) {
         if updates.is_empty() {
             return;
         }
@@ -681,6 +776,114 @@ impl GitPullRequestPanel {
                     .flex_col()
                     .child(self.render_changes(cx)),
             )
+            .child(self.render_review_footer(cx))
+    }
+
+    fn render_review_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_submitting = self.is_submitting_review;
+        let body_empty = self.review_editor.read(cx).is_empty(cx);
+        let selected_event = self.selected_review_event;
+        let title = match selected_event {
+            PullRequestReviewEvent::Approve => "Approve",
+            PullRequestReviewEvent::RequestChanges => "Request Changes",
+            PullRequestReviewEvent::Comment => "Comment",
+        };
+        let body_required = matches!(
+            selected_event,
+            PullRequestReviewEvent::Comment | PullRequestReviewEvent::RequestChanges
+        );
+        let can_submit = !is_submitting && (!body_required || !body_empty);
+        let colors = cx.theme().colors();
+
+        let editor_focus_handle = self.review_editor.focus_handle(cx);
+
+        v_flex()
+            .id("review-editor-container")
+            .w_full()
+            .gap(px(8.))
+            .p_2()
+            .cursor_text()
+            .border_t_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
+                window.focus(&editor_focus_handle, cx);
+            }))
+            .child(self.review_editor.clone())
+            .child(
+                h_flex().w_full().justify_end().child(SplitButton::new(
+                    ButtonLike::new_rounded_left(ElementId::Name(
+                        format!("review-submit-{title}").into(),
+                    ))
+                    .layer(ElevationIndex::ModalSurface)
+                    .size(ButtonSize::Compact)
+                    .child(
+                        Label::new(title)
+                            .size(LabelSize::Small)
+                            .color(if can_submit {
+                                Color::Default
+                            } else {
+                                Color::Disabled
+                            })
+                            .mr_0p5(),
+                    )
+                    .disabled(!can_submit)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.submit_review(selected_event, window, cx);
+                    })),
+                    self.render_review_event_menu(cx).into_any_element(),
+                )),
+            )
+    }
+
+    fn render_review_event_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = cx.weak_entity();
+
+        PopoverMenu::new("review-event-menu")
+            .trigger(
+                ButtonLike::new_rounded_right("review-event-menu-trigger")
+                    .layer(ElevationIndex::ModalSurface)
+                    .size(ButtonSize::None)
+                    .child(
+                        h_flex()
+                            .px_1()
+                            .h_full()
+                            .justify_center()
+                            .border_l_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+                    ),
+            )
+            .menu(move |window, cx| {
+                let panel = panel.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let p1 = panel.clone();
+                    let p2 = panel.clone();
+                    let p3 = panel;
+                    menu.entry("Comment", None, move |_, cx| {
+                        p1.update(cx, |this, cx| {
+                            this.selected_review_event = PullRequestReviewEvent::Comment;
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .entry("Approve", None, move |_, cx| {
+                        p2.update(cx, |this, cx| {
+                            this.selected_review_event = PullRequestReviewEvent::Approve;
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .entry("Request Changes", None, move |_, cx| {
+                        p3.update(cx, |this, cx| {
+                            this.selected_review_event = PullRequestReviewEvent::RequestChanges;
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                }))
+            })
+            .anchor(Anchor::TopRight)
     }
 
     fn render_detail_header(

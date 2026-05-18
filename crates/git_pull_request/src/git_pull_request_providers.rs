@@ -25,9 +25,11 @@ pub struct GitHubPullRequest {
 pub struct GitHubPullRequestRef {
     #[serde(rename = "ref")]
     pub ref_name: String,
+    #[serde(default)]
+    pub sha: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct GitHubPullRequestUser {
     pub login: String,
 }
@@ -101,6 +103,127 @@ pub enum GitHubPullRequestFileStatus {
     Unchanged,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct GitHubPullRequestReviewComment {
+    pub id: u64,
+    pub body: String,
+    pub path: String,
+    pub user: GitHubPullRequestUser,
+    pub created_at: DateTime<Utc>,
+    pub commit_id: String,
+    #[serde(default)]
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub original_line: Option<u32>,
+    #[serde(default)]
+    pub start_line: Option<u32>,
+    #[serde(default)]
+    pub side: Option<String>,
+    #[serde(default)]
+    pub in_reply_to_id: Option<u64>,
+}
+
+pub async fn fetch_pull_request_review_comments(
+    client: Arc<dyn HttpClient>,
+    remote: &ParsedGitRemote,
+    pull_number: u32,
+    credentials_provider: Arc<dyn CredentialsProvider>,
+    cx: &AsyncApp,
+) -> anyhow::Result<Vec<GitHubPullRequestReviewComment>> {
+    let ParsedGitRemote { owner, repo } = remote;
+    let url = base_url()
+        .join(&format!(
+            "{owner}/{repo}/pulls/{pull_number}/comments?per_page=100"
+        ))
+        .expect("can't build pull request comments url")
+        .to_string();
+
+    let mut request = Request::get(&url)
+        .header("Content-Type", "application/json")
+        .follow_redirects(http_client::RedirectPolicy::FollowAll);
+
+    if let Some(github_token) = resolve_github_token(credentials_provider, cx).await {
+        request = request.header("Authorization", format!("Bearer {}", github_token));
+    } else {
+        log::warn!("GITHUB_TOKEN is not set");
+    }
+
+    let mut response = client
+        .send(request.body(AsyncBody::default())?)
+        .await
+        .with_context(|| format!("error fetching pull request comments at {:?}", url))?;
+
+    let mut body = Vec::new();
+    response.body_mut().read_to_end(&mut body).await?;
+
+    if !response.status().is_success() {
+        let text = String::from_utf8_lossy(&body);
+        bail!("status error {}: {text:?}", response.status().as_u16());
+    }
+
+    Ok(serde_json::from_slice(&body)?)
+}
+
+pub async fn create_pull_request_review_comment(
+    client: Arc<dyn HttpClient>,
+    remote: &ParsedGitRemote,
+    pull_number: u32,
+    commit_id: String,
+    path: String,
+    line: u32,
+    side: &str,
+    body: String,
+    in_reply_to_id: Option<u64>,
+    credentials_provider: Arc<dyn CredentialsProvider>,
+    cx: &AsyncApp,
+) -> anyhow::Result<GitHubPullRequestReviewComment> {
+    let ParsedGitRemote { owner, repo } = remote;
+    let url = base_url()
+        .join(&format!("{owner}/{repo}/pulls/{pull_number}/comments"))
+        .expect("can't build pull request comment url")
+        .to_string();
+
+    let mut payload = serde_json::json!({
+        "body": body,
+        "commit_id": commit_id,
+        "path": path,
+        "line": line,
+        "side": side,
+    });
+    if let Some(reply_id) = in_reply_to_id
+        && let Some(map) = payload.as_object_mut()
+    {
+        map.insert("in_reply_to".into(), serde_json::json!(reply_id));
+    }
+    let payload_bytes = serde_json::to_vec(&payload)?;
+
+    let mut request = Request::post(&url)
+        .header("Content-Type", "application/json")
+        .follow_redirects(http_client::RedirectPolicy::FollowAll);
+
+    if let Some(github_token) = resolve_github_token(credentials_provider, cx).await {
+        request = request.header("Authorization", format!("Bearer {}", github_token));
+    } else {
+        log::warn!("GITHUB_TOKEN is not set");
+    }
+
+    let mut response = client
+        .send(request.body(AsyncBody::from(payload_bytes))?)
+        .await
+        .with_context(|| format!("error creating review comment at {:?}", url))?;
+
+    let mut body_buf = Vec::new();
+    response.body_mut().read_to_end(&mut body_buf).await?;
+
+    if !response.status().is_success() {
+        let text = String::from_utf8_lossy(&body_buf);
+        bail!("status error {}: {text:?}", response.status().as_u16());
+    }
+
+    Ok(serde_json::from_slice(&body_buf)?)
+}
+
 pub async fn fetch_pull_request_files(
     client: Arc<dyn HttpClient>,
     remote: &ParsedGitRemote,
@@ -141,6 +264,158 @@ pub async fn fetch_pull_request_files(
     }
 
     Ok(serde_json::from_slice(&body)?)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullRequestReviewEvent {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+impl PullRequestReviewEvent {
+    fn as_api_value(self) -> &'static str {
+        match self {
+            PullRequestReviewEvent::Approve => "APPROVE",
+            PullRequestReviewEvent::RequestChanges => "REQUEST_CHANGES",
+            PullRequestReviewEvent::Comment => "COMMENT",
+        }
+    }
+}
+
+pub async fn submit_pull_request_review(
+    client: Arc<dyn HttpClient>,
+    remote: &ParsedGitRemote,
+    pull_number: u32,
+    body: String,
+    event: PullRequestReviewEvent,
+    credentials_provider: Arc<dyn CredentialsProvider>,
+    cx: &AsyncApp,
+) -> anyhow::Result<()> {
+    let ParsedGitRemote { owner, repo } = remote;
+    let url = base_url()
+        .join(&format!("{owner}/{repo}/pulls/{pull_number}/reviews"))
+        .expect("can't build review url")
+        .to_string();
+
+    let payload = serde_json::json!({
+        "body": body,
+        "event": event.as_api_value(),
+    });
+    let payload_bytes = serde_json::to_vec(&payload)?;
+
+    let mut request = Request::post(&url)
+        .header("Content-Type", "application/json")
+        .follow_redirects(http_client::RedirectPolicy::FollowAll);
+
+    if let Some(github_token) = resolve_github_token(credentials_provider, cx).await {
+        request = request.header("Authorization", format!("Bearer {}", github_token));
+    } else {
+        log::warn!("GITHUB_TOKEN is not set");
+    }
+
+    let mut response = client
+        .send(request.body(AsyncBody::from(payload_bytes))?)
+        .await
+        .with_context(|| format!("error submitting review at {url:?}"))?;
+
+    let mut buf = Vec::new();
+    response.body_mut().read_to_end(&mut buf).await?;
+
+    if !response.status().is_success() {
+        let text = String::from_utf8_lossy(&buf);
+        bail!("status error {}: {text:?}", response.status().as_u16());
+    }
+
+    Ok(())
+}
+
+pub async fn fetch_pull_request_viewed_files(
+    client: Arc<dyn HttpClient>,
+    pull_request_node_id: String,
+    credentials_provider: Arc<dyn CredentialsProvider>,
+    cx: &AsyncApp,
+) -> anyhow::Result<Vec<String>> {
+    let query = r#"
+        query($prId: ID!) {
+            node(id: $prId) {
+                ... on PullRequest {
+                    files(first: 100) {
+                        nodes { path viewerViewedState }
+                    }
+                }
+            }
+        }
+    "#;
+    let body = serde_json::json!({
+        "query": query,
+        "variables": { "prId": pull_request_node_id },
+    });
+    let body_bytes = serde_json::to_vec(&body)?;
+
+    let mut request = Request::post("https://api.github.com/graphql")
+        .header("Content-Type", "application/json")
+        .follow_redirects(http_client::RedirectPolicy::FollowAll);
+
+    if let Some(github_token) = resolve_github_token(credentials_provider, cx).await {
+        request = request.header("Authorization", format!("Bearer {}", github_token));
+    } else {
+        log::warn!("GITHUB_TOKEN is not set");
+    }
+
+    let mut response = client
+        .send(request.body(AsyncBody::from(body_bytes))?)
+        .await
+        .context("error fetching viewed files")?;
+
+    let mut buf = Vec::new();
+    response.body_mut().read_to_end(&mut buf).await?;
+
+    if !response.status().is_success() {
+        let text = String::from_utf8_lossy(&buf);
+        bail!("status error {}: {text:?}", response.status().as_u16());
+    }
+
+    #[derive(Deserialize)]
+    struct Resp {
+        data: Option<Data>,
+        errors: Option<serde_json::Value>,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        node: Option<Node>,
+    }
+    #[derive(Deserialize)]
+    struct Node {
+        files: Files,
+    }
+    #[derive(Deserialize)]
+    struct Files {
+        nodes: Vec<FileNode>,
+    }
+    #[derive(Deserialize)]
+    struct FileNode {
+        path: String,
+        #[serde(rename = "viewerViewedState")]
+        viewed_state: String,
+    }
+
+    let parsed: Resp = serde_json::from_slice(&buf)?;
+    if let Some(errors) = parsed.errors {
+        bail!("graphql errors: {errors}");
+    }
+
+    let nodes = parsed
+        .data
+        .and_then(|d| d.node)
+        .map(|n| n.files.nodes)
+        .unwrap_or_default();
+
+    Ok(nodes
+        .into_iter()
+        .filter(|node| node.viewed_state == "VIEWED")
+        .map(|node| node.path)
+        .collect())
 }
 
 pub async fn set_pull_request_file_viewed(

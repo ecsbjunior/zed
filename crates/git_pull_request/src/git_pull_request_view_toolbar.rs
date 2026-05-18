@@ -27,12 +27,14 @@ impl Render for GitPullRequestViewToolbar {
         };
 
         let (additions, deletions) = pull_request_view.read(cx).calculate_changed_lines(cx);
+        let comments_visible = pull_request_view.read(cx).review_comments_visible();
 
         h_flex()
             .gap_1()
             .when(additions > 0 || deletions > 0, |this| {
                 self.render_diff_stat(this, additions, deletions)
             })
+            .child(self.render_toggle_comments(&pull_request_view, comments_visible))
             .child(self.render_buffer_search())
             .child(self.render_view_on_provider())
     }
@@ -50,6 +52,32 @@ impl GitPullRequestViewToolbar {
                 ))
                 .child(Divider::vertical()),
         )
+    }
+
+    fn render_toggle_comments(
+        &self,
+        view: &gpui::Entity<GitPullRequestView>,
+        visible: bool,
+    ) -> impl IntoElement {
+        let icon = if visible {
+            IconName::Eye
+        } else {
+            IconName::EyeOff
+        };
+        let tooltip = if visible {
+            "Hide Review Comments"
+        } else {
+            "Show Review Comments"
+        };
+        let weak_view = view.downgrade();
+        IconButton::new("toggle-review-comments", icon)
+            .icon_size(IconSize::Small)
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(move |_, _, cx| {
+                weak_view
+                    .update(cx, |this, cx| this.toggle_review_comments_visibility(cx))
+                    .ok();
+            })
     }
 
     fn render_buffer_search(&self) -> impl IntoElement {
