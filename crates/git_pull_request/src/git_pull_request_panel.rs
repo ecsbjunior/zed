@@ -1,6 +1,6 @@
 use anyhow::Result;
 use credentials_provider::CredentialsProvider;
-use editor::{Editor, EditorSettings, ui_scrollbar_settings_from_raw};
+use editor::{Editor, EditorEvent, EditorSettings, ui_scrollbar_settings_from_raw};
 use file_icons::FileIcons;
 use git::{GitHostingProviderRegistry, ParsedGitRemote};
 use gpui::{
@@ -157,6 +157,16 @@ impl GitPullRequestPanel {
                         this.update_pull_requests(cx);
                     }
                     _ => {}
+                },
+            )
+            .detach();
+
+            cx.subscribe(
+                &filter_editor,
+                |_this, _editor, event: &EditorEvent, cx| {
+                    if matches!(event, EditorEvent::BufferEdited) {
+                        cx.notify();
+                    }
                 },
             )
             .detach();
@@ -725,23 +735,53 @@ impl GitPullRequestPanel {
             })
     }
 
+    fn filtered_pull_request_indices(&self, cx: &App) -> Vec<usize> {
+        let query = self.filter_editor.read(cx).text(cx);
+        let query = query.trim();
+        if query.is_empty() {
+            return (0..self.pull_requests.len()).collect();
+        }
+        let needle = query.trim_start_matches('#').to_lowercase();
+        self.pull_requests
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, pr)| {
+                let number = pr.number.to_string();
+                let matches = number.contains(&needle)
+                    || pr.title.to_lowercase().contains(&needle)
+                    || pr.user.login.to_lowercase().contains(&needle);
+                matches.then_some(idx)
+            })
+            .collect()
+    }
+
     fn render_pull_requests(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let visible_indices = self.filtered_pull_request_indices(cx);
+        let show_empty_state =
+            self.pull_requests_load_task.is_none() && visible_indices.is_empty();
         v_flex()
             .size_full()
+            .when(show_empty_state, |this| {
+                this.child(self.render_empty_filter_state(cx))
+            })
             .child(
                 uniform_list(
                     "entries",
-                    self.pull_requests.len(),
+                    visible_indices.len(),
                     cx.processor(move |this, range: Range<usize>, _window, cx| {
+                        let indices = this.filtered_pull_request_indices(cx);
                         let mut items = Vec::with_capacity(range.end - range.start);
 
-                        for idx in range {
-                            if let Some(entry) = this.pull_requests.get(idx) {
-                                items.push(this.render_pull_request_entry(idx, entry, cx))
+                        for visible_idx in range {
+                            let Some(&original_idx) = indices.get(visible_idx) else {
+                                continue;
+                            };
+                            if let Some(entry) = this.pull_requests.get(original_idx) {
+                                items.push(this.render_pull_request_entry(original_idx, entry, cx))
                             }
                         }
 
@@ -759,6 +799,24 @@ impl GitPullRequestPanel {
                     .tracked_entity(cx.entity_id()),
                 window,
                 cx,
+            )
+    }
+
+    fn render_empty_filter_state(&self, cx: &App) -> impl IntoElement {
+        let query = self.filter_editor.read(cx).text(cx);
+        let message = if query.trim().is_empty() {
+            "No open pull requests"
+        } else {
+            "No pull requests match your filter"
+        };
+        h_flex()
+            .w_full()
+            .justify_center()
+            .py_4()
+            .child(
+                Label::new(message)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
             )
     }
 
