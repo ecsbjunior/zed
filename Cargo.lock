@@ -7420,6 +7420,7 @@ name = "git_pull_request"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "buffer_diff",
  "chrono",
  "credentials_provider",

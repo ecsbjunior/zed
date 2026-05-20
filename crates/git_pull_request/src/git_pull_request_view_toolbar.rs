@@ -1,4 +1,4 @@
-use gpui::{Context, EventEmitter, IntoElement, Render, WeakEntity, Window};
+use gpui::{Context, Entity, EventEmitter, IntoElement, Render, WeakEntity, Window};
 use ui::{DiffStat, Divider, Tooltip, prelude::*};
 use workspace::{ItemHandle, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView};
 
@@ -26,55 +26,53 @@ impl Render for GitPullRequestViewToolbar {
             return div();
         };
 
-        let (additions, deletions) = pull_request_view.read(cx).calculate_changed_lines(cx);
-        let comments_visible = pull_request_view.read(cx).review_comments_visible();
-
         h_flex()
             .gap_1()
-            .when(additions > 0 || deletions > 0, |this| {
-                self.render_diff_stat(this, additions, deletions)
-            })
-            .child(self.render_toggle_comments(&pull_request_view, comments_visible))
+            .child(self.render_diff_stat(&pull_request_view, cx))
+            .child(self.render_toggle_comments(&pull_request_view, cx))
             .child(self.render_buffer_search())
-            .child(self.render_view_on_provider())
+            .child(self.render_view_on_provider(&pull_request_view, cx))
     }
 }
 
 impl GitPullRequestViewToolbar {
-    fn render_diff_stat(&self, this: Div, additions: u32, deletions: u32) -> Div {
-        this.child(
-            h_flex()
-                .gap_2()
-                .child(DiffStat::new(
-                    "toolbar-diff-stat",
-                    additions as usize,
-                    deletions as usize,
-                ))
-                .child(Divider::vertical()),
-        )
+    fn render_diff_stat(
+        &self,
+        pull_request_view: &Entity<GitPullRequestView>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let (additions, deletions) = pull_request_view.read(cx).calculate_changed_lines(cx);
+
+        h_flex()
+            .gap_2()
+            .child(DiffStat::new(
+                "toolbar-diff-stat",
+                additions as usize,
+                deletions as usize,
+            ))
+            .child(Divider::vertical())
     }
 
     fn render_toggle_comments(
         &self,
-        view: &gpui::Entity<GitPullRequestView>,
-        visible: bool,
+        pull_request_view: &Entity<GitPullRequestView>,
+        cx: &Context<Self>,
     ) -> impl IntoElement {
-        let icon = if visible {
-            IconName::Eye
+        let is_visible = pull_request_view.read(cx).review_comments_visible();
+
+        let (icon, tooltip) = if is_visible {
+            (IconName::Eye, "Hide Review Comments")
         } else {
-            IconName::EyeOff
+            (IconName::EyeOff, "Show Review Comments")
         };
-        let tooltip = if visible {
-            "Hide Review Comments"
-        } else {
-            "Show Review Comments"
-        };
-        let weak_view = view.downgrade();
-        IconButton::new("toggle-review-comments", icon)
+
+        let weak_pull_request_view = pull_request_view.downgrade();
+
+        IconButton::new("toggle-review-comments-visibility", icon)
             .icon_size(IconSize::Small)
             .tooltip(Tooltip::text(tooltip))
-            .on_click(move |_, _, cx| {
-                weak_view
+            .on_click(move |_event, _window, cx| {
+                weak_pull_request_view
                     .update(cx, |this, cx| this.toggle_review_comments_visibility(cx))
                     .ok();
             })
@@ -95,10 +93,24 @@ impl GitPullRequestViewToolbar {
             })
     }
 
-    fn render_view_on_provider(&self) -> impl IntoElement {
+    fn render_view_on_provider(
+        &self,
+        pull_request_view: &Entity<GitPullRequestView>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let view = pull_request_view.read(cx);
+        let url = view.pull_request_url(cx).map(|url| url.to_string());
+        let tooltip = format!("View on {}", view.provider_name());
+
         IconButton::new("view-on-provider", IconName::Github)
             .icon_size(IconSize::Small)
-            .tooltip(Tooltip::text("View on Github"))
+            .disabled(url.is_none())
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(move |_event, _window, cx| {
+                if let Some(url) = url.as_deref() {
+                    cx.open_url(url);
+                }
+            })
     }
 }
 
@@ -117,13 +129,5 @@ impl ToolbarItemView for GitPullRequestViewToolbar {
         }
         self.git_pull_request_view = None;
         ToolbarItemLocation::Hidden
-    }
-
-    fn pane_focus_update(
-        &mut self,
-        _pane_focused: bool,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
     }
 }

@@ -6,21 +6,21 @@ use editor::{
     multibuffer_context_lines,
     scroll::Autoscroll,
 };
-use multi_buffer::ExcerptBoundaryInfo;
 use git::{
     GitHostingProviderRegistry, ParsedGitRemote,
     repository::RepoPath,
     status::{DiffTreeType, FileStatus, StatusCode, TrackedStatus, TreeDiffStatus},
 };
 use gpui::{
-    AnyElement, App, AppContext, AsyncApp, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString,
-    Subscription, TaskExt, WeakEntity, Window, actions,
+    AnyElement, App, AppContext, AsyncApp, Context, DismissEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    SharedString, Subscription, TaskExt, WeakEntity, Window, actions,
 };
 use language::{
     Buffer, BufferId, Capability, DiskState, LanguageRegistry, LineEnding, OffsetRangeExt,
     ReplicaId, Rope, TextBuffer, ToPoint,
 };
+use multi_buffer::ExcerptBoundaryInfo;
 use project::{Project, WorktreeId, git_store::Repository};
 use std::{
     any::{Any, TypeId},
@@ -34,6 +34,7 @@ use ui::{
     FluentBuilder, Icon, IconName, LabelCommon, LabelSize, Styled, StyledExt, ToggleState, Tooltip,
     div, h_flex,
 };
+use url::Url;
 use util::{ResultExt, paths::PathStyle, rel_path::RelPath, truncate_and_trailoff};
 use workspace::{
     Item, ItemHandle, ItemNavHistory, Workspace,
@@ -45,8 +46,7 @@ use workspace::{
 use crate::{
     git_pull_request_panel::GitPullRequestPanel,
     git_pull_request_providers::{
-        GitHubPullRequest, GitHubPullRequestReviewComment, create_pull_request_review_comment,
-        fetch_pull_request_review_comments,
+        NewReviewComment, PullRequest, PullRequestProvider, PullRequestReviewComment,
     },
 };
 
@@ -132,10 +132,10 @@ pub struct GitPullRequestView {
     active_repository: Option<Entity<Repository>>,
     editor: Entity<Editor>,
     project: Entity<Project>,
-    // TODO: change GitHubPullRequest, use an abstraction
-    pull_request: Arc<GitHubPullRequest>,
+    provider: Arc<dyn PullRequestProvider>,
+    pull_request: Arc<PullRequest>,
     multibuffer: Entity<MultiBuffer>,
-    review_comments: Vec<Arc<GitHubPullRequestReviewComment>>,
+    review_comments: Vec<Arc<PullRequestReviewComment>>,
     comment_block_ids: Vec<CustomBlockId>,
     show_review_comments: bool,
     _workspace: WeakEntity<Workspace>,
@@ -149,6 +149,23 @@ impl GitPullRequestView {
 
     pub fn pull_request_number(&self) -> u32 {
         self.pull_request.number
+    }
+
+    pub fn provider_name(&self) -> &'static str {
+        self.provider.name()
+    }
+
+    pub fn pull_request_url(&self, cx: &App) -> Option<Url> {
+        let repository = self.active_repository.as_ref()?;
+        let remote_url = repository.read(cx).default_remote_url()?;
+        let provider_registry = GitHostingProviderRegistry::global(cx);
+        let (host, remote) = git::parse_git_remote_url(provider_registry, &remote_url)?;
+        let mut url = host.base_url();
+        url.set_path(&format!(
+            "/{}/{}/pull/{}",
+            remote.owner, remote.repo, self.pull_request.number
+        ));
+        Some(url)
     }
 
     pub fn move_to_path(
@@ -175,7 +192,8 @@ impl GitPullRequestView {
 
     pub fn open(
         active_repository: Option<Entity<Repository>>,
-        pull_request: Arc<GitHubPullRequest>,
+        provider: Arc<dyn PullRequestProvider>,
+        pull_request: Arc<PullRequest>,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut App,
@@ -192,6 +210,7 @@ impl GitPullRequestView {
                         let pull_request_view = cx.new(|cx| {
                             GitPullRequestView::new(
                                 active_repository,
+                                provider,
                                 pull_request,
                                 project.clone(),
                                 workspace_handle,
@@ -231,7 +250,8 @@ impl GitPullRequestView {
 
     fn new(
         active_repository: Option<Entity<Repository>>,
-        pull_request: Arc<GitHubPullRequest>,
+        provider: Arc<dyn PullRequestProvider>,
+        pull_request: Arc<PullRequest>,
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
         panel: Option<Entity<GitPullRequestPanel>>,
@@ -254,7 +274,14 @@ impl GitPullRequestView {
             let view_for_hunk = weak_view.clone();
             editor.set_render_diff_hunk_controls(
                 Arc::new(
-                    move |row, status, hunk_range, _is_created, line_height, _editor, _window, cx| {
+                    move |row,
+                          status,
+                          hunk_range,
+                          _is_created,
+                          line_height,
+                          _editor,
+                          _window,
+                          cx| {
                         render_pr_hunk_comment_button(
                             view_for_hunk.clone(),
                             row,
@@ -281,6 +308,7 @@ impl GitPullRequestView {
             active_repository,
             editor,
             project: project.clone(),
+            provider,
             pull_request,
             multibuffer,
             review_comments: Vec::new(),
@@ -303,30 +331,14 @@ impl GitPullRequestView {
         let pull_request_number = self.pull_request.number;
         let base_ref_name = self.pull_request.base.ref_name.clone();
 
-        let work_directory = repository
-            .read(cx)
-            .snapshot()
-            .work_directory_abs_path
-            .clone();
-        let head_refspec = format!(
-            "pull/{n}/head:refs/{n}/head",
-            n = pull_request_number
-        );
-        let base_refspec = format!(
-            "{base_ref_name}:refs/{n}/base",
-            n = pull_request_number
-        );
+        let work_directory = repository.read(cx).snapshot().work_directory_abs_path;
+        let head_refspec = format!("pull/{n}/head:refs/{n}/head", n = pull_request_number);
+        let base_refspec = format!("{base_ref_name}:refs/{n}/base", n = pull_request_number);
 
         cx.spawn(async move |this, cx| {
             let output = smol::process::Command::new("git")
                 .current_dir(work_directory.as_ref())
-                .args([
-                    "fetch",
-                    "--force",
-                    "origin",
-                    &head_refspec,
-                    &base_refspec,
-                ])
+                .args(["fetch", "--force", "origin", &head_refspec, &base_refspec])
                 .output()
                 .await?;
 
@@ -355,16 +367,10 @@ impl GitPullRequestView {
         };
 
         let pull_request_number = self.pull_request.number;
-        let head_ref: SharedString =
-            format!("refs/{}/head", pull_request_number).into();
-        let base_ref: SharedString =
-            format!("refs/{}/base", pull_request_number).into();
+        let head_ref: SharedString = format!("refs/{}/head", pull_request_number).into();
+        let base_ref: SharedString = format!("refs/{}/base", pull_request_number).into();
 
-        let work_directory = repository
-            .read(cx)
-            .snapshot()
-            .work_directory_abs_path
-            .clone();
+        let work_directory = repository.read(cx).snapshot().work_directory_abs_path;
 
         let diff_rx = repository.update(cx, |repository, cx| {
             repository.diff_tree(
@@ -534,16 +540,12 @@ impl GitPullRequestView {
         let pull_number = self.pull_request.number;
         let client = cx.http_client();
         let credentials = zed_credentials_provider::global(cx);
+        let provider = self.provider.clone();
 
         cx.spawn(async move |this, cx| -> anyhow::Result<()> {
-            let comments = fetch_pull_request_review_comments(
-                client,
-                &git_remote,
-                pull_number,
-                credentials,
-                cx,
-            )
-            .await?;
+            let comments = provider
+                .list_review_comments(client, &git_remote, pull_number, credentials, cx)
+                .await?;
 
             this.update(cx, |this, cx| {
                 this.review_comments = comments.into_iter().map(Arc::new).collect();
@@ -576,7 +578,7 @@ impl GitPullRequestView {
             return;
         }
 
-        let mut grouped: HashMap<(String, u32), Vec<Arc<GitHubPullRequestReviewComment>>> =
+        let mut grouped: HashMap<(String, u32), Vec<Arc<PullRequestReviewComment>>> =
             HashMap::new();
         for comment in &self.review_comments {
             let Some(line) = comment.line.or(comment.original_line) else {
@@ -632,9 +634,9 @@ impl GitPullRequestView {
             return;
         }
 
-        let new_ids = self.editor.update(cx, |editor, cx| {
-            editor.insert_blocks(new_blocks, None, cx)
-        });
+        let new_ids = self
+            .editor
+            .update(cx, |editor, cx| editor.insert_blocks(new_blocks, None, cx));
         self.comment_block_ids = new_ids;
         cx.notify();
     }
@@ -667,9 +669,7 @@ impl GitPullRequestView {
         let weak_view = cx.weak_entity();
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, move |window, cx| {
-                PullRequestCommentModal::new(
-                    weak_view, path, line, "RIGHT", commit_id, window, cx,
-                )
+                PullRequestCommentModal::new(weak_view, path, line, "RIGHT", commit_id, window, cx)
             });
         });
     }
@@ -693,8 +693,7 @@ impl GitPullRequestView {
         let (text_anchor, buffer_snapshot) = snapshot.anchor_to_buffer_anchor(hunk_range.end)?;
         let row = text_anchor.to_point(buffer_snapshot).row;
         let last_row = row.saturating_sub(1);
-        let new_text_anchor =
-            buffer_snapshot.anchor_before(language::Point::new(last_row, 0));
+        let new_text_anchor = buffer_snapshot.anchor_before(language::Point::new(last_row, 0));
         snapshot.anchor_in_excerpt(new_text_anchor)
     }
 
@@ -714,22 +713,20 @@ impl GitPullRequestView {
         let pull_number = self.pull_request.number;
         let client = cx.http_client();
         let credentials = zed_credentials_provider::global(cx);
+        let provider = self.provider.clone();
 
         cx.spawn(async move |this, cx| -> anyhow::Result<()> {
-            let result = create_pull_request_review_comment(
-                client,
-                &git_remote,
-                pull_number,
+            let comment = NewReviewComment {
                 commit_id,
                 path,
                 line,
-                side,
+                side: side.to_string(),
                 body,
-                None,
-                credentials,
-                cx,
-            )
-            .await;
+                in_reply_to_id: None,
+            };
+            let result = provider
+                .create_review_comment(client, &git_remote, pull_number, comment, credentials, cx)
+                .await;
 
             this.update(cx, |this, cx| match result {
                 Ok(_) => this.load_review_comments(cx),
@@ -742,7 +739,7 @@ impl GitPullRequestView {
 }
 
 fn render_comment_thread_block(
-    comments: &[Arc<GitHubPullRequestReviewComment>],
+    comments: &[Arc<PullRequestReviewComment>],
     cx: &mut editor::display_map::BlockContext,
 ) -> impl IntoElement {
     let colors = cx.theme().colors();
@@ -1039,8 +1036,7 @@ fn render_pr_hunk_comment_button(
                 .on_click(move |_, window, cx| {
                     let hunk_range = hunk_range.clone();
                     view.update(cx, |view, cx| {
-                        let selection =
-                            view.editor.read(cx).selections.newest_anchor().clone();
+                        let selection = view.editor.read(cx).selections.newest_anchor().clone();
                         let snapshot = view.multibuffer.read(cx).snapshot(cx);
                         let selection_is_empty = selection.start.cmp(&selection.end, &snapshot)
                             == std::cmp::Ordering::Equal;

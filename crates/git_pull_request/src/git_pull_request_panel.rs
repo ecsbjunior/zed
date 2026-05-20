@@ -39,10 +39,9 @@ use workspace::{
 
 use crate::{
     git_pull_request_providers::{
-        GitHubPullRequest, GitHubPullRequestFile, GitHubPullRequestFileStatus,
-        PULL_REQUEST_FILES_PER_PAGE, PULL_REQUESTS_PER_PAGE, PullRequestReviewEvent,
-        fetch_pull_request_files_page, fetch_pull_request_viewed_files, fetch_pull_requests_page,
-        set_pull_request_file_viewed, submit_pull_request_review,
+        GithubPullRequestProvider, PULL_REQUEST_FILES_PER_PAGE, PULL_REQUESTS_PER_PAGE,
+        PullRequest, PullRequestFile, PullRequestFileStatus, PullRequestProvider,
+        PullRequestReviewEvent,
     },
     git_pull_request_view::GitPullRequestView,
 };
@@ -87,9 +86,10 @@ pub struct GitPullRequestPanel {
     focus_handle: FocusHandle,
     is_submitting_review: bool,
     project: Entity<Project>,
-    pull_request_files: Vec<Arc<GitHubPullRequestFile>>,
+    provider: Arc<dyn PullRequestProvider>,
+    pull_request_files: Vec<Arc<PullRequestFile>>,
     pull_request_files_load_task: Option<Task<()>>,
-    pull_requests: Vec<Arc<GitHubPullRequest>>,
+    pull_requests: Vec<Arc<PullRequest>>,
     pull_requests_load_task: Option<Task<()>>,
     review_editor: Entity<Editor>,
     selected_review_event: PullRequestReviewEvent,
@@ -172,6 +172,8 @@ impl GitPullRequestPanel {
             .detach();
 
             let credentials_provider = zed_credentials_provider::global(cx);
+            let provider: Arc<dyn PullRequestProvider> =
+                Arc::new(GithubPullRequestProvider::new());
 
             let mut this = Self {
                 active_repository,
@@ -182,6 +184,7 @@ impl GitPullRequestPanel {
                 focus_handle,
                 is_submitting_review: false,
                 project,
+                provider,
                 pull_request_files: Vec::new(),
                 pull_request_files_load_task: None,
                 pull_requests: Vec::new(),
@@ -209,6 +212,7 @@ impl GitPullRequestPanel {
 
         let client = cx.http_client();
         let credentials_provider = self.credentials_provider.clone();
+        let provider = self.provider.clone();
 
         self.pull_requests.clear();
         self.selected_pull_request_idx = None;
@@ -217,15 +221,16 @@ impl GitPullRequestPanel {
         self.pull_requests_load_task = Some(cx.spawn(async move |this, cx| {
             let mut page: u32 = 1;
             loop {
-                let prs = match fetch_pull_requests_page(
-                    client.clone(),
-                    &git_remote,
-                    page,
-                    PULL_REQUESTS_PER_PAGE,
-                    credentials_provider.clone(),
-                    cx,
-                )
-                .await
+                let prs = match provider
+                    .list_pull_requests(
+                        client.clone(),
+                        &git_remote,
+                        page,
+                        PULL_REQUESTS_PER_PAGE,
+                        credentials_provider.clone(),
+                        cx,
+                    )
+                    .await
                 {
                     Ok(prs) => prs,
                     Err(err) => {
@@ -265,6 +270,7 @@ impl GitPullRequestPanel {
 
         let client = cx.http_client();
         let credentials_provider = self.credentials_provider.clone();
+        let provider = self.provider.clone();
 
         self.pull_request_files.clear();
         self.reviewed_files.clear();
@@ -273,16 +279,17 @@ impl GitPullRequestPanel {
         self.pull_request_files_load_task = Some(cx.spawn(async move |this, cx| {
             let mut page: u32 = 1;
             loop {
-                let files = match fetch_pull_request_files_page(
-                    client.clone(),
-                    &git_remote,
-                    pull_number,
-                    page,
-                    PULL_REQUEST_FILES_PER_PAGE,
-                    credentials_provider.clone(),
-                    cx,
-                )
-                .await
+                let files = match provider
+                    .list_pull_request_files(
+                        client.clone(),
+                        &git_remote,
+                        pull_number,
+                        page,
+                        PULL_REQUEST_FILES_PER_PAGE,
+                        credentials_provider.clone(),
+                        cx,
+                    )
+                    .await
                 {
                     Ok(files) => files,
                     Err(err) => {
@@ -306,7 +313,8 @@ impl GitPullRequestPanel {
             }
 
             if let Some(node_id) = pr_node_id.filter(|id| !id.is_empty()) {
-                match fetch_pull_request_viewed_files(client, node_id, credentials_provider, cx)
+                match provider
+                    .list_viewed_files(client, node_id, credentials_provider, cx)
                     .await
                 {
                     Ok(viewed) => {
@@ -358,6 +366,7 @@ impl GitPullRequestPanel {
             self.load_pull_request_files(pull_request.number, cx);
             GitPullRequestView::open(
                 self.active_repository.clone(),
+                self.provider.clone(),
                 pull_request,
                 self.workspace.clone(),
                 window,
@@ -407,18 +416,12 @@ impl GitPullRequestPanel {
         let pull_number = pull_request.number;
         let client = cx.http_client();
         let credentials = self.credentials_provider.clone();
+        let provider = self.provider.clone();
 
         cx.spawn_in(window, async move |this, cx| -> anyhow::Result<()> {
-            let result = submit_pull_request_review(
-                client,
-                &git_remote,
-                pull_number,
-                body,
-                event,
-                credentials,
-                cx,
-            )
-            .await;
+            let result = provider
+                .submit_review(client, &git_remote, pull_number, body, event, credentials, cx)
+                .await;
             this.update_in(cx, |this, window, cx| {
                 this.is_submitting_review = false;
                 if let Err(err) = result {
@@ -491,18 +494,20 @@ impl GitPullRequestPanel {
         }
         let client = cx.http_client();
         let credentials = self.credentials_provider.clone();
+        let provider = self.provider.clone();
 
         cx.spawn(async move |_, cx| -> anyhow::Result<()> {
             for (path, viewed) in updates {
-                if let Err(err) = set_pull_request_file_viewed(
-                    client.clone(),
-                    node_id.clone(),
-                    path.clone(),
-                    viewed,
-                    credentials.clone(),
-                    cx,
-                )
-                .await
+                if let Err(err) = provider
+                    .set_file_viewed(
+                        client.clone(),
+                        node_id.clone(),
+                        path.clone(),
+                        viewed,
+                        credentials.clone(),
+                        cx,
+                    )
+                    .await
                 {
                     log::error!("failed to sync viewed state for {path:?}: {err:?}");
                 }
@@ -823,7 +828,7 @@ impl GitPullRequestPanel {
     fn render_pull_request_entry(
         &self,
         idx: usize,
-        entry: &GitHubPullRequest,
+        entry: &PullRequest,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = ElementId::Name(format!("entry_{}", idx).into());
@@ -832,9 +837,7 @@ impl GitPullRequestPanel {
         let metadata = format!(
             "{} · {} on ",
             entry.user.login,
-            FormatDistance::from_now(DateTimeType::Local(entry.created_at.into()))
-                .add_suffix(true)
-                .to_string()
+            FormatDistance::from_now(DateTimeType::Local(entry.created_at.into())).add_suffix(true)
         );
         let is_selected = Some(idx) == self.selected_pull_request_idx;
 
@@ -1020,7 +1023,7 @@ impl GitPullRequestPanel {
 
     fn render_detail_header(
         &self,
-        _pull_request: &GitHubPullRequest,
+        _pull_request: &PullRequest,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         h_flex()
@@ -1048,7 +1051,7 @@ impl GitPullRequestPanel {
 
     fn render_pr_info_block(
         &self,
-        pull_request: &GitHubPullRequest,
+        pull_request: &PullRequest,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let title = format!("#{} — {}", pull_request.number, pull_request.title.as_str());
@@ -1057,7 +1060,6 @@ impl GitPullRequestPanel {
             pull_request.user.login,
             FormatDistance::from_now(DateTimeType::Local(pull_request.created_at.into()))
                 .add_suffix(true)
-                .to_string()
         );
 
         let title_label = Label::new(title).size(LabelSize::Default);
@@ -1301,7 +1303,7 @@ impl GitPullRequestPanel {
     fn render_file_entry(
         &self,
         idx: usize,
-        file: &GitHubPullRequestFile,
+        file: &PullRequestFile,
         depth: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1324,8 +1326,8 @@ impl GitPullRequestPanel {
             .into();
 
         let (status_icon, status_color) = match file.status {
-            GitHubPullRequestFileStatus::Added => (IconName::SquarePlus, Color::Created),
-            GitHubPullRequestFileStatus::Removed => (IconName::SquareMinus, Color::Deleted),
+            PullRequestFileStatus::Added => (IconName::SquarePlus, Color::Created),
+            PullRequestFileStatus::Removed => (IconName::SquareMinus, Color::Deleted),
             _ => (IconName::SquareDot, Color::Modified),
         };
 
