@@ -223,14 +223,25 @@ impl GitPullRequestView {
                         let pane = workspace.active_pane();
 
                         pane.update(cx, |pane, cx| {
-                            let idx = pane.items().position(|item| {
-                                item.downcast::<GitPullRequestView>().is_some_and(|this| {
-                                    this.read(cx).pull_request.number == pull_request_number
-                                })
+                            let existing = pane.items().enumerate().find_map(|(idx, item)| {
+                                let view = item.downcast::<GitPullRequestView>()?;
+                                (view.read(cx).pull_request.number == pull_request_number)
+                                    .then_some((idx, view))
                             });
 
-                            if let Some(idx) = idx {
-                                pane.activate_item(idx, true, true, window, cx);
+                            // Reopening an already-open pull request replaces the
+                            // existing view with a freshly loaded one in place,
+                            // rather than just activating the stale tab.
+                            if let Some((idx, existing)) = existing {
+                                pane.remove_item(existing.item_id(), false, false, window, cx);
+                                pane.add_item(
+                                    Box::new(pull_request_view),
+                                    true,
+                                    true,
+                                    Some(idx),
+                                    window,
+                                    cx,
+                                );
                             } else {
                                 pane.add_item(
                                     Box::new(pull_request_view),

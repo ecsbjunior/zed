@@ -438,36 +438,20 @@ impl PullRequestProvider for GithubPullRequestProvider {
         credentials_provider: Arc<dyn CredentialsProvider>,
         cx: &AsyncApp,
     ) -> anyhow::Result<Vec<String>> {
+        // The GitHub GraphQL API caps `files` at 100 nodes per page, so we
+        // follow the `pageInfo` cursor until every page has been fetched.
         let query = r#"
-            query($prId: ID!) {
+            query($prId: ID!, $cursor: String) {
                 node(id: $prId) {
                     ... on PullRequest {
-                        files(first: 100) {
+                        files(first: 100, after: $cursor) {
                             nodes { path viewerViewedState }
+                            pageInfo { hasNextPage endCursor }
                         }
                     }
                 }
             }
         "#;
-        let body = serde_json::json!({
-            "query": query,
-            "variables": { "prId": pull_request_node_id },
-        });
-        let body_bytes = serde_json::to_vec(&body)?;
-
-        let request = Request::post(GITHUB_GRAPHQL_URL)
-            .header("Content-Type", "application/json")
-            .follow_redirects(http_client::RedirectPolicy::FollowAll);
-        let buf = self
-            .send(
-                &client,
-                request,
-                AsyncBody::from(body_bytes),
-                credentials_provider,
-                cx,
-                "error fetching viewed files".to_string(),
-            )
-            .await?;
 
         #[derive(Deserialize)]
         struct Resp {
@@ -485,6 +469,15 @@ impl PullRequestProvider for GithubPullRequestProvider {
         #[derive(Deserialize)]
         struct Files {
             nodes: Vec<FileNode>,
+            #[serde(rename = "pageInfo")]
+            page_info: PageInfo,
+        }
+        #[derive(Deserialize)]
+        struct PageInfo {
+            #[serde(rename = "hasNextPage")]
+            has_next_page: bool,
+            #[serde(rename = "endCursor")]
+            end_cursor: Option<String>,
         }
         #[derive(Deserialize)]
         struct FileNode {
@@ -493,22 +486,53 @@ impl PullRequestProvider for GithubPullRequestProvider {
             viewed_state: String,
         }
 
-        let parsed: Resp = serde_json::from_slice(&buf)?;
-        if let Some(errors) = parsed.errors {
-            bail!("graphql errors: {errors}");
+        let mut viewed_files = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let body = serde_json::json!({
+                "query": query,
+                "variables": { "prId": pull_request_node_id, "cursor": cursor },
+            });
+            let body_bytes = serde_json::to_vec(&body)?;
+
+            let request = Request::post(GITHUB_GRAPHQL_URL)
+                .header("Content-Type", "application/json")
+                .follow_redirects(http_client::RedirectPolicy::FollowAll);
+            let buf = self
+                .send(
+                    &client,
+                    request,
+                    AsyncBody::from(body_bytes),
+                    credentials_provider.clone(),
+                    cx,
+                    "error fetching viewed files".to_string(),
+                )
+                .await?;
+
+            let parsed: Resp = serde_json::from_slice(&buf)?;
+            if let Some(errors) = parsed.errors {
+                bail!("graphql errors: {errors}");
+            }
+
+            let Some(files) = parsed.data.and_then(|d| d.node).map(|n| n.files) else {
+                break;
+            };
+
+            viewed_files.extend(
+                files
+                    .nodes
+                    .into_iter()
+                    .filter(|node| node.viewed_state == "VIEWED")
+                    .map(|node| node.path),
+            );
+
+            if !files.page_info.has_next_page || files.page_info.end_cursor.is_none() {
+                break;
+            }
+            cursor = files.page_info.end_cursor;
         }
 
-        let nodes = parsed
-            .data
-            .and_then(|d| d.node)
-            .map(|n| n.files.nodes)
-            .unwrap_or_default();
-
-        Ok(nodes
-            .into_iter()
-            .filter(|node| node.viewed_state == "VIEWED")
-            .map(|node| node.path)
-            .collect())
+        Ok(viewed_files)
     }
 
     async fn set_file_viewed(
